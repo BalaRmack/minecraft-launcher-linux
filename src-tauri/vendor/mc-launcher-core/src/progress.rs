@@ -37,6 +37,8 @@ pub enum SkipReason {
 /// Event emitted during install and download operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
+    /// A separately planned group of independent files.
+    BatchStarted { total: usize },
     /// A coarse install stage started.
     StageStarted {
         /// Stage that started.
@@ -79,6 +81,10 @@ pub trait ProgressReporter {
     /// Whether the caller has requested cooperative cancellation.
     fn is_cancelled(&self) -> bool {
         false
+    }
+    /// Optional content-addressed cache shared by otherwise isolated instances.
+    fn cache_dir(&self) -> Option<PathBuf> {
+        None
     }
 }
 

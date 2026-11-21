@@ -49,10 +49,24 @@ struct InstallProgress {
     last: std::time::Instant,
     completed: usize,
     reused: usize,
+    total: usize,
+    received: u64,
+    per_file: HashMap<String, u64>,
+    batch_started: std::time::Instant,
+    cache: PathBuf,
 }
 impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
     fn report(&mut self, ev: ProgressEvent) {
         let label = match ev {
+            ProgressEvent::BatchStarted { total } => {
+                self.completed = 0;
+                self.reused = 0;
+                self.total = total;
+                self.received = 0;
+                self.per_file.clear();
+                self.batch_started = std::time::Instant::now();
+                format!("Новый этап: файлов {total}")
+            }
             ProgressEvent::TaskStarted { label, .. } => label,
             ProgressEvent::TaskFinished { label } => {
                 self.completed += 1;
@@ -66,30 +80,36 @@ impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
                 label,
                 received,
                 total,
-            } => match total.filter(|n| *n > 0) {
-                Some(total) => format!(
-                    "{} · текущий файл {}%",
-                    label,
-                    received.saturating_mul(100) / total
-                ),
-                None => format!("{} · {} КБ", label, received / 1024),
-            },
+            } => {
+                let previous = self.per_file.insert(label.clone(), received).unwrap_or(0);
+                self.received += if received >= previous {
+                    received - previous
+                } else {
+                    received
+                };
+                match total.filter(|n| *n > 0) {
+                    Some(total) => {
+                        format!("{} · файл {}%", label, received.saturating_mul(100) / total)
+                    }
+                    None => format!("{} · {} КБ", label, received / 1024),
+                }
+            }
             _ => return,
         };
         if self.last.elapsed() >= std::time::Duration::from_millis(250) {
-            emit_install(
-                &self.app,
-                &self.id,
-                &format!(
-                    "{label} · загружено {} · из кэша {}",
-                    self.completed, self.reused
-                ),
-            );
+            let done = self.completed + self.reused;
+            let speed = self.received as f64
+                / self.batch_started.elapsed().as_secs_f64().max(0.01)
+                / 1_000_000.0;
+            emit_install(&self.app, &self.id, &format!("{label} · этап {done}/{} · осталось {} · загружено {} · из кэша {} · {:.2} МБ/с",self.total,self.total.saturating_sub(done),self.completed,self.reused,speed));
             self.last = std::time::Instant::now();
         }
     }
     fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+    fn cache_dir(&self) -> Option<PathBuf> {
+        Some(self.cache.clone())
     }
 }
 fn emit_install(app: &tauri::AppHandle, id: &str, message: &str) {
@@ -757,6 +777,11 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             last: std::time::Instant::now() - std::time::Duration::from_secs(1),
             completed: 0,
             reused: 0,
+            total: 0,
+            received: 0,
+            per_file: HashMap::new(),
+            batch_started: std::time::Instant::now(),
+            cache: managed_child(&root(&app)?, "downloads-cache", true)?,
         };
         let result = Launcher::new(&dir)
             .install_with_progress_and_java(
