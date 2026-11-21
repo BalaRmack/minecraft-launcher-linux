@@ -18,6 +18,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "v3"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "time", "sync"] }
 md5 = "0.7"
 mc-launcher-core = { path = "vendor/mc-launcher-core" }
 flate2 = "1"

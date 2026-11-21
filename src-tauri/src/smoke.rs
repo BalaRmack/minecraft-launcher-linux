@@ -2,9 +2,66 @@
 use crate::{catalog, integrity, java, modrinth, offline_uuid};
 use mc_launcher_core::prelude::*;
 use std::{
+    collections::HashMap,
     fs,
+    path::PathBuf,
     process::{Command, Stdio},
+    time::Instant,
 };
+struct Metrics {
+    cache: PathBuf,
+    started: Instant,
+    downloads: usize,
+    reused: usize,
+    bytes: u64,
+    current: HashMap<String, u64>,
+}
+impl Metrics {
+    fn new(cache: PathBuf) -> Self {
+        Self {
+            cache,
+            started: Instant::now(),
+            downloads: 0,
+            reused: 0,
+            bytes: 0,
+            current: HashMap::new(),
+        }
+    }
+    fn print(&self, name: &str) {
+        let secs = self.started.elapsed().as_secs_f64();
+        eprintln!(
+            "BENCHMARK {name}: {:.2}s downloaded={} reused={} network_bytes={} avg_MB_s={:.2}",
+            secs,
+            self.downloads,
+            self.reused,
+            self.bytes,
+            self.bytes as f64 / secs.max(0.01) / 1_000_000.0
+        );
+    }
+}
+impl ProgressReporter for Metrics {
+    fn report(&mut self, e: ProgressEvent) {
+        match e {
+            ProgressEvent::BatchStarted { .. } => self.current.clear(),
+            ProgressEvent::TaskFinished { .. } => self.downloads += 1,
+            ProgressEvent::TaskSkipped { .. } => self.reused += 1,
+            ProgressEvent::BytesReceived {
+                label, received, ..
+            } => {
+                let before = self.current.insert(label, received).unwrap_or(0);
+                self.bytes += if received >= before {
+                    received - before
+                } else {
+                    received
+                };
+            }
+            _ => (),
+        }
+    }
+    fn cache_dir(&self) -> Option<PathBuf> {
+        Some(self.cache.clone())
+    }
+}
 
 pub fn run() {
     use std::time::{Duration, Instant};
@@ -23,9 +80,82 @@ pub fn run() {
     assert!(java.starts_with(temp.path().join("runtime")));
     let reused_java = java::resolve(temp.path(), java.to_str().unwrap(), 17, |_| {}).unwrap();
     assert_eq!(java, reused_java);
+    let cache = temp.path().join("shared-cache");
+    fs::create_dir(&cache).unwrap();
+    let legacy_root = temp.path().join("legacy");
+    let legacy_launcher = Launcher::new(&legacy_root);
+    let java8 = java::resolve(temp.path(), "auto", 8, |s| eprintln!("{s}")).unwrap();
+    let mut first = Metrics::new(cache.clone());
+    let legacy = legacy_launcher
+        .install_with_progress_and_java(InstallRequest::vanilla("1.10"), &mut first, &java8)
+        .unwrap();
+    first.print("vanilla-1.10-first");
+    let mut repeat = Metrics::new(cache.clone());
+    legacy_launcher
+        .install_with_progress_and_java(InstallRequest::vanilla("1.10"), &mut repeat, &java8)
+        .unwrap();
+    repeat.print("vanilla-1.10-repeat");
+    assert!(repeat.reused > 100);
+    let second_root = temp.path().join("legacy-second-instance");
+    let mut shared = Metrics::new(cache.clone());
+    Launcher::new(&second_root)
+        .install_with_progress_and_java(InstallRequest::vanilla("1.10"), &mut shared, &java8)
+        .unwrap();
+    shared.print("vanilla-1.10-shared-cache");
+    assert!(shared.reused > 100);
+    let legacy_game = temp.path().join("legacy-game");
+    fs::create_dir_all(&legacy_game).unwrap();
+    let legacy_version = legacy_launcher.load_version(&legacy.version_id).unwrap();
+    let legacy_command = legacy_launcher
+        .build_launch_command_from_version(
+            &legacy_version,
+            LaunchOptions {
+                account: Account::Offline {
+                    username: "HorizonSmoke".into(),
+                    uuid: offline_uuid("HorizonSmoke"),
+                },
+                java_executable: Some(java8),
+                game_directory: Some(legacy_game.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let out = fs::File::create(legacy_game.join("process.log")).unwrap();
+    let mut old = Command::new(legacy_command.executable)
+        .arg("-Xmx1024M")
+        .args(legacy_command.args)
+        .envs(legacy_command.env)
+        .current_dir(legacy_command.working_dir)
+        .stdout(Stdio::from(out.try_clone().unwrap()))
+        .stderr(Stdio::from(out))
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    let old_success = loop {
+        let log = fs::read_to_string(legacy_game.join("logs/latest.log")).unwrap_or_default();
+        if log.contains("Reloading ResourceManager") {
+            break true;
+        }
+        if old.try_wait().unwrap().is_some() || start.elapsed() > Duration::from_secs(180) {
+            break false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let _ = old.kill();
+    let _ = old.wait();
+    if !old_success {
+        panic!(
+            "Minecraft 1.10 failed to initialize graphics: {}",
+            fs::read_to_string(legacy_game.join("process.log")).unwrap_or_default()
+        );
+    }
     let root = temp.path().join("minecraft");
     let launcher = Launcher::new(&root);
-    let vanilla = launcher.install(InstallRequest::vanilla("1.20.1")).unwrap();
+    let mut modern_first = Metrics::new(cache.clone());
+    let vanilla = launcher
+        .install_with_progress_and_java(InstallRequest::vanilla("1.20.1"), &mut modern_first, &java)
+        .unwrap();
+    modern_first.print("vanilla-1.20.1-first");
     let mut skipped = 0usize;
     launcher
         .install_with_progress(InstallRequest::vanilla("1.20.1"), &mut |event| {
@@ -38,6 +168,7 @@ pub fn run() {
         skipped > 100,
         "verified libraries and assets should be reused"
     );
+    let mut fabric_metrics = Metrics::new(cache.clone());
     let fabric = launcher
         .install_with_progress_and_java(
             InstallRequest {
@@ -47,10 +178,11 @@ pub fn run() {
                 }),
                 java: JavaInstallPolicy::Never,
             },
-            &mut |_e| {},
+            &mut fabric_metrics,
             &java,
         )
         .unwrap();
+    fabric_metrics.print("fabric-1.20.1");
     for (number, installed) in [vanilla, fabric].into_iter().enumerate() {
         integrity::verify(&root, &installed.version_id).unwrap();
         if number == 0 {
@@ -72,6 +204,15 @@ pub fn run() {
             })
             .unwrap();
             assert!(count > 0);
+            let mods_started = Instant::now();
+            let lithium =
+                modrinth::install(&game.join("mods"), "lithium", "1.20.1", "fabric", |_| {})
+                    .unwrap();
+            assert!(lithium > 0);
+            eprintln!(
+                "BENCHMARK fabric-second-mod: {:.2}s files={lithium}",
+                mods_started.elapsed().as_secs_f64()
+            );
             let cache = catalog::Cache::default();
             let search = catalog::search(
                 &cache,

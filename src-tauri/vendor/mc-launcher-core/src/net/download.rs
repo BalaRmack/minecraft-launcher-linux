@@ -158,7 +158,26 @@ fn cache_key(cache: Option<&std::path::Path>, checksum: &Option<Checksum>) -> Op
     if hash.len() != expected || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    Some(cache?.join(kind).join(hash.to_ascii_lowercase()))
+    let root = cache?;
+    // Reject pre-existing symlinked cache directories, rather than writing outside the app tree.
+    match fs::create_dir(root) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(_) => return None,
+    }
+    if !fs::symlink_metadata(root).ok()?.file_type().is_dir() {
+        return None;
+    }
+    let dir = root.join(kind);
+    match fs::create_dir(&dir) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(_) => return None,
+    }
+    if !fs::symlink_metadata(&dir).ok()?.file_type().is_dir() {
+        return None;
+    }
+    Some(dir.join(hash.to_ascii_lowercase()))
 }
 async fn download_one(
     client: reqwest::Client,
@@ -184,7 +203,11 @@ async fn download_one(
     if let Some(path) = &cache_path {
         let mut cached = task.clone();
         cached.destination = path.clone();
-        if should_skip_existing(&cached).unwrap_or(false) {
+        if fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+            && should_skip_existing(&cached).unwrap_or(false)
+        {
             let temp = tempfile::NamedTempFile::new_in(parent)?;
             fs::copy(path, temp.path())?;
             if !should_skip_existing(&DownloadTask {

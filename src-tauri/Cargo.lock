@@ -1563,6 +1563,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 

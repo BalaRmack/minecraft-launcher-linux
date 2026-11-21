@@ -1316,6 +1316,96 @@ mod tests {
     }
 
     #[test]
+    fn downloads_independent_files_concurrently_and_reuses_shared_cache() {
+        use mc_launcher_core::{
+            net::download::{execute_plan, Checksum, DownloadPlan, DownloadTask},
+            progress::ProgressReporter,
+        };
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::atomic::{AtomicUsize, Ordering},
+            time::Duration,
+        };
+        struct Reporter {
+            cache: PathBuf,
+            reused: usize,
+        }
+        impl ProgressReporter for Reporter {
+            fn report(&mut self, event: ProgressEvent) {
+                if matches!(event, ProgressEvent::TaskSkipped { .. }) {
+                    self.reused += 1;
+                }
+            }
+            fn cache_dir(&self) -> Option<PathBuf> {
+                Some(self.cache.clone())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let worker_active = active.clone();
+        let worker_peak = peak.clone();
+        let worker = std::thread::spawn(move || {
+            let mut children = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let a = worker_active.clone();
+                let p = worker_peak.clone();
+                children.push(std::thread::spawn(move || {
+                    let mut buf = [0; 4096];
+                    let _ = stream.read(&mut buf);
+                    let n = a.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                    )
+                    .unwrap();
+                    a.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for child in children {
+                child.join().unwrap();
+            }
+        });
+        let tasks: Vec<_> = (0..4)
+            .map(|i| DownloadTask {
+                url: format!("http://{addr}/{i}"),
+                destination: temp.path().join(format!("one/{i}")),
+                checksum: Some(Checksum::Sha1(
+                    "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".into(),
+                )),
+                label: format!("file-{i}"),
+            })
+            .collect();
+        let mut reporter = Reporter {
+            cache: temp.path().join("cache"),
+            reused: 0,
+        };
+        execute_plan(
+            &DownloadPlan {
+                tasks: tasks.clone(),
+            },
+            &mut reporter,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert!(peak.load(Ordering::SeqCst) > 1, "requests must overlap");
+        let mut other = tasks;
+        for (i, task) in other.iter_mut().enumerate() {
+            task.destination = temp.path().join(format!("two/{i}"));
+        }
+        execute_plan(&DownloadPlan { tasks: other }, &mut reporter).unwrap();
+        assert_eq!(reporter.reused, 4);
+        fs::write(temp.path().join("one/0"), b"modified").unwrap();
+        assert_eq!(fs::read(temp.path().join("two/0")).unwrap(), b"hello");
+    }
+
+    #[test]
     fn verified_download_is_reused_and_failed_download_preserves_old_file() {
         use mc_launcher_core::net::download::{execute_plan, Checksum, DownloadPlan, DownloadTask};
         use std::{

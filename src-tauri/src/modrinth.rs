@@ -225,6 +225,97 @@ fn recognized_existing(resolver: &Resolver<'_>, dir: &Path) -> Result<Vec<Value>
     }
     Ok(out)
 }
+struct ModDownload {
+    name: String,
+    url: String,
+    hash: String,
+    temp: PathBuf,
+}
+async fn download_mod(client: reqwest::Client, item: ModDownload) -> Result<()> {
+    let mut last = String::new();
+    for attempt in 0..3 {
+        let result: Result<()> = async {
+            let mut response = client
+                .get(&item.url)
+                .send()
+                .await
+                .map_err(err)?
+                .error_for_status()
+                .map_err(err)?;
+            if response.content_length().unwrap_or(0) > MAX_FILE {
+                return Err("Файл мода слишком велик".into());
+            }
+            let mut out = fs::File::create(&item.temp).map_err(err)?;
+            let mut digest = Sha512::new();
+            let mut size = 0u64;
+            while let Some(chunk) = response.chunk().await.map_err(err)? {
+                size += chunk.len() as u64;
+                if size > MAX_FILE {
+                    return Err("Файл мода слишком велик".into());
+                }
+                digest.update(&chunk);
+                out.write_all(&chunk).map_err(err)?;
+            }
+            if format!("{:x}", digest.finalize()) != item.hash {
+                return Err(format!("Контрольная сумма {} не совпадает", item.name));
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = e;
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt + 1))).await;
+                }
+            }
+        }
+    }
+    Err(last)
+}
+fn download_mods(files: Vec<ModDownload>) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(err)?;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .user_agent(
+                "BalaRmack/Horizon/0.1.0 (https://github.com/BalaRmack/minecraft-launcher-linux)",
+            )
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(err)?;
+        let mut pending = files.into_iter();
+        let mut jobs = tokio::task::JoinSet::new();
+        loop {
+            while jobs.len() < 4 {
+                if let Some(item) = pending.next() {
+                    jobs.spawn(download_mod(client.clone(), item));
+                } else {
+                    break;
+                }
+            }
+            match jobs.join_next().await {
+                None => break,
+                Some(Ok(Ok(()))) => (),
+                Some(Ok(Err(e))) => {
+                    jobs.abort_all();
+                    while jobs.join_next().await.is_some() {}
+                    return Err(e);
+                }
+                Some(Err(e)) => {
+                    jobs.abort_all();
+                    while jobs.join_next().await.is_some() {}
+                    return Err(err(e));
+                }
+            }
+        }
+        Ok(())
+    })
+}
 /// Downloads all required files before promoting any of them. Never overwrites existing mods.
 pub fn install(
     dir: &Path,
@@ -249,6 +340,7 @@ pub fn install(
     let stage = tempfile::tempdir_in(dir).map_err(err)?;
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut names = HashMap::new();
+    let mut downloads = Vec::new();
     for file in &resolver.files {
         let (name, url, hash) = metadata(file)?;
         if let Some(previous) = names.insert(name.to_string(), hash.to_string()) {
@@ -270,38 +362,16 @@ pub fn install(
             continue;
         }
         progress(&format!("Мод: {name}"));
-        let mut response = resolver
-            .client
-            .get(url)
-            .send()
-            .map_err(err)?
-            .error_for_status()
-            .map_err(err)?;
-        if response.content_length().unwrap_or(0) > MAX_FILE {
-            return Err("Файл мода слишком велик".into());
-        }
         let temp = stage.path().join(format!("{}", staged.len()));
-        let mut out = fs::File::create(&temp).map_err(err)?;
-        let mut digest = Sha512::new();
-        let mut size = 0u64;
-        let mut buf = [0u8; 65536];
-        loop {
-            let n = response.read(&mut buf).map_err(err)?;
-            if n == 0 {
-                break;
-            }
-            size += n as u64;
-            if size > MAX_FILE {
-                return Err("Файл мода слишком велик".into());
-            }
-            digest.update(&buf[..n]);
-            out.write_all(&buf[..n]).map_err(err)?;
-        }
-        if format!("{:x}", digest.finalize()) != hash.to_ascii_lowercase() {
-            return Err(format!("Контрольная сумма {name} не совпадает"));
-        }
+        downloads.push(ModDownload {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            hash: hash.to_ascii_lowercase(),
+            temp: temp.clone(),
+        });
         staged.push((temp, dest));
     }
+    download_mods(downloads)?;
     let mut created = Vec::new();
     for (temp, dest) in staged {
         if let Err(e) = fs::hard_link(temp, &dest) {
@@ -338,6 +408,63 @@ mod tests {
         assert!(check_existing(&[planned.clone()], &[old]).is_err());
         assert!(check_existing(&[planned.clone()], &[other]).is_err());
         assert!(check_existing(&[planned.clone()], &[planned]).is_ok());
+    }
+    #[test]
+    fn stages_independent_mod_files_concurrently_and_verifies_hashes() {
+        use std::{
+            net::TcpListener,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::Duration,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let a = active.clone();
+        let p = peak.clone();
+        let server = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let a = a.clone();
+                let p = p.clone();
+                workers.push(std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let count = a.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(count, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                    )
+                    .unwrap();
+                    a.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for w in workers {
+                w.join().unwrap();
+            }
+        });
+        let hash = format!("{:x}", Sha512::digest(b"hello"));
+        let files = (0..4)
+            .map(|i| ModDownload {
+                name: format!("{i}.jar"),
+                url: format!("http://{addr}/{i}"),
+                hash: hash.clone(),
+                temp: dir.path().join(format!("{i}")),
+            })
+            .collect();
+        download_mods(files).unwrap();
+        server.join().unwrap();
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        for i in 0..4 {
+            assert_eq!(fs::read(dir.path().join(format!("{i}"))).unwrap(), b"hello");
+        }
     }
     #[test]
     fn resolves_required_dependencies_and_cycles() {
