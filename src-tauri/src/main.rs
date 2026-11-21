@@ -3,6 +3,7 @@ mod catalog;
 mod integrity;
 mod java;
 mod loaders;
+mod mod_state;
 mod modrinth;
 #[cfg(any(test, feature = "smoke-test"))]
 mod smoke;
@@ -1235,6 +1236,17 @@ async fn inspect_mods(app: tauri::AppHandle, id: String) -> Result<serde_json::V
     .map_err(err)?
 }
 #[tauri::command]
+async fn mod_status(app: tauri::AppHandle, id: String) -> Result<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy = acquire(&app, &id)?;
+        let c = db(&app)?;
+        let p = profile(&c, &id)?;
+        mod_state::status(&mods_dir(&app, &id)?, &p.version, &p.loader)
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
 async fn search_mods(query: String) -> Result<serde_json::Value> {
     if query.len() > 100 {
         return Err("Слишком длинный запрос".into());
@@ -1282,7 +1294,12 @@ async fn mod_details(project: String) -> Result<serde_json::Value> {
     .map_err(err)?
 }
 #[tauri::command]
-async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Result<usize> {
+async fn install_mod(
+    app: tauri::AppHandle,
+    id: String,
+    project: String,
+    update: Option<bool>,
+) -> Result<usize> {
     let busy = acquire(&app, &id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _busy = busy;
@@ -1295,16 +1312,32 @@ async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Resu
         integrity::verify(&dir, p.installed_id.as_deref().unwrap())
             .map_err(|e| format!("Сначала восстановите сборку: {e}"))?;
         let cache = managed_child(&root(&app)?, "modrinth-cache", true)?;
-        modrinth::install_with_cache(
-            &mods_dir(&app, &id)?,
-            &project,
-            &p.version,
-            &p.loader,
-            Some(&cache),
-            |s| {
-                let _ = app.emit("install-progress", s.to_string());
-            },
-        )
+        let mods = mods_dir(&app, &id)?;
+        let progress = |s: &str| {
+            let _ = app.emit(
+                "mod-install-progress",
+                serde_json::json!({"id":id,"project":project,"message":s}),
+            );
+        };
+        if update.unwrap_or(false) {
+            modrinth::update_with_cache(
+                &mods,
+                &project,
+                &p.version,
+                &p.loader,
+                Some(&cache),
+                progress,
+            )
+        } else {
+            modrinth::install_with_cache(
+                &mods,
+                &project,
+                &p.version,
+                &p.loader,
+                Some(&cache),
+                progress,
+            )
+        }
     })
     .await
     .map_err(err)?
@@ -1352,6 +1385,7 @@ fn main() {
             catalog_categories,
             catalog_details,
             inspect_mods,
+            mod_status,
             mod_details,
             install_mod
         ])

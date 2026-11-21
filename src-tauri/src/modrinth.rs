@@ -195,37 +195,6 @@ fn check_existing(planned: &[Value], existing: &[Value]) -> Result<()> {
     }
     Ok(())
 }
-fn recognized_existing(resolver: &Resolver<'_>, dir: &Path) -> Result<Vec<Value>> {
-    let mut hashes = Vec::new();
-    for entry in fs::read_dir(dir).map_err(err)? {
-        let entry = entry.map_err(err)?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if entry.file_type().map_err(err)?.is_file()
-            && name.ends_with(".jar")
-            && safe_mod_name(&name)
-        {
-            hashes.push(hash_file(&entry.path())?);
-        }
-    }
-    let mut out = Vec::new();
-    for chunk in hashes.chunks(100) {
-        let data: Value = resolver
-            .client
-            .post(format!("{}/version_files", resolver.api))
-            .json(&serde_json::json!({"hashes":chunk, "algorithm":"sha512"}))
-            .send()
-            .map_err(err)?
-            .error_for_status()
-            .map_err(err)?
-            .json()
-            .map_err(err)?;
-        let map = data
-            .as_object()
-            .ok_or("Некорректный ответ Modrinth при проверке установленных модов")?;
-        out.extend(map.values().cloned());
-    }
-    Ok(out)
-}
 struct ModDownload {
     name: String,
     url: String,
@@ -340,6 +309,27 @@ pub fn install_with_cache(
     cache: Option<&Path>,
     progress: impl Fn(&str),
 ) -> Result<usize> {
+    install_inner(dir, project, minecraft, loader, cache, false, progress)
+}
+pub fn update_with_cache(
+    dir: &Path,
+    project: &str,
+    minecraft: &str,
+    loader: &str,
+    cache: Option<&Path>,
+    progress: impl Fn(&str),
+) -> Result<usize> {
+    install_inner(dir, project, minecraft, loader, cache, true, progress)
+}
+fn install_inner(
+    dir: &Path,
+    project: &str,
+    minecraft: &str,
+    loader: &str,
+    cache: Option<&Path>,
+    updating: bool,
+    progress: impl Fn(&str),
+) -> Result<usize> {
     let mut resolver = Resolver {
         client: client()?,
         api: "https://api.modrinth.com/v2".into(),
@@ -352,14 +342,64 @@ pub fn install_with_cache(
     resolver.resolve(Some(project), None)?;
     fs::create_dir_all(dir).map_err(err)?;
     progress("Проверка известных конфликтов модов");
-    check_existing(&resolver.versions, &recognized_existing(&resolver, dir)?)?;
+    let (local, complete) = crate::mod_state::scan(dir)?;
+    if !complete {
+        return Err("Не удалось проверить установленные моды через Modrinth".into());
+    }
+    let root = resolver.versions.last().ok_or("Нет версии мода")?;
+    let target_id = str_field(root, "project_id")?;
+    let existing: Vec<_> = local
+        .iter()
+        .filter(|f| {
+            f.version
+                .as_ref()
+                .is_some_and(|v| v["project_id"] == target_id)
+        })
+        .collect();
+    if existing.len() > 1 {
+        return Err(
+            "Найдено несколько файлов этого проекта; проверьте их в разделе Мои моды".into(),
+        );
+    }
+    if !updating && !existing.is_empty() {
+        return Ok(0);
+    }
+    let old = if updating {
+        let old = existing
+            .first()
+            .ok_or("Установленный мод не найден; обновите каталог")?;
+        if !old.name.ends_with(".jar") {
+            return Err("Сначала включите мод в разделе Мои моды".into());
+        }
+        let prior = old.version.as_ref().ok_or("Версия мода неизвестна")?;
+        if root["id"] == prior["id"]
+            || !root["date_published"]
+                .as_str()
+                .zip(prior["date_published"].as_str())
+                .is_some_and(|(a, b)| a > b)
+        {
+            return Err("Более новая совместимая версия не найдена".into());
+        }
+        Some(*old)
+    } else {
+        None
+    };
+    let other_versions: Vec<Value> = local
+        .iter()
+        .filter(|f| old.map_or(true, |o| o.name != f.name))
+        .filter(|f| f.name.ends_with(".jar"))
+        .filter_map(|f| f.version.clone())
+        .collect();
+    check_existing(&resolver.versions, &other_versions)?;
+    let mut records = crate::mod_state::ledger(dir)?;
     let stage = tempfile::tempdir_in(dir).map_err(err)?;
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut names = HashMap::new();
     let mut downloads = Vec::new();
     let mut cache_writes = Vec::new();
-    for file in &resolver.files {
+    for (file, version) in resolver.files.iter().zip(&resolver.versions) {
         let (name, url, hash) = metadata(file)?;
+        records.insert(hash.to_ascii_lowercase(), version.clone());
         if let Some(previous) = names.insert(name.to_string(), hash.to_string()) {
             if previous != hash {
                 return Err("Два мода имеют одинаковые имена файлов".into());
@@ -373,10 +413,16 @@ pub fn install_with_cache(
             ));
         }
         if let Ok(meta) = fs::symlink_metadata(&dest) {
-            if !meta.file_type().is_file() || hash_file(&dest)? != hash.to_ascii_lowercase() {
-                return Err(format!("Файл {name} уже существует и отличается"));
+            if old.is_some_and(|o| o.name == name) {
+                if !meta.file_type().is_file() || hash_file(&dest)? != old.unwrap().hash {
+                    return Err("Файл мода изменился во время обновления".into());
+                }
+            } else {
+                if !meta.file_type().is_file() || hash_file(&dest)? != hash.to_ascii_lowercase() {
+                    return Err(format!("Файл {name} уже существует и отличается"));
+                }
+                continue;
             }
-            continue;
         }
         progress(&format!("Мод: {name}"));
         let temp = stage.path().join(format!("{}", staged.len()));
@@ -426,15 +472,60 @@ pub fn install_with_cache(
             })();
         }
     }
-    let mut created = Vec::new();
-    for (temp, dest) in staged {
-        if let Err(e) = fs::hard_link(temp, &dest) {
-            for path in created {
-                let _ = fs::remove_file(path);
-            }
-            return Err(err(e));
+    // Move the exact previously scanned file to an independent backup only after
+    // every new file is downloaded and verified. Roll back on any promotion error.
+    let backup = if let Some(old) = old {
+        let old_path = dir.join(&old.name);
+        if !fs::symlink_metadata(&old_path)
+            .map_err(err)?
+            .file_type()
+            .is_file()
+            || hash_file(&old_path)? != old.hash
+        {
+            return Err("Файл мода изменился во время обновления".into());
         }
-        created.push(dest);
+        let backup_root = dir
+            .parent()
+            .ok_or("Некорректная папка модов")?
+            .join(".horizon-mod-backups");
+        fs::create_dir_all(&backup_root).map_err(err)?;
+        if !fs::symlink_metadata(&backup_root)
+            .map_err(err)?
+            .file_type()
+            .is_dir()
+        {
+            return Err("Папка резервных копий небезопасна".into());
+        }
+        let folder = backup_root.join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&folder).map_err(err)?;
+        let path = folder.join(&old.name);
+        fs::rename(&old_path, &path).map_err(err)?;
+        Some((old_path, path))
+    } else {
+        None
+    };
+    let mut created: Vec<PathBuf> = Vec::new();
+    let promote = (|| -> Result<()> {
+        for (temp, dest) in staged {
+            fs::hard_link(temp, &dest).map_err(err)?;
+            created.push(dest);
+        }
+        crate::mod_state::save(dir, &records)?;
+        Ok(())
+    })();
+    if let Err(e) = promote {
+        for path in &created {
+            let _ = fs::remove_file(path);
+        }
+        if let Some((original, backup)) = &backup {
+            if let Err(restore) = fs::rename(backup, original) {
+                return Err(format!(
+                    "{e}; не удалось восстановить прежний файл: {restore}. Резервная копия: {}",
+                    backup.display()
+                ));
+            }
+        }
+        return Err(e);
     }
     Ok(created.len())
 }
