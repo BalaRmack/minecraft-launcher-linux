@@ -20,14 +20,12 @@ jobs:
           workspaces: src-tauri -> target
       - name: Test Rust core
         run: .github/scripts/annotated.sh cargo test --manifest-path src-tauri/Cargo.toml
-      - name: Expose lockfile for reproducible source snapshot
-        run: |
-          python3 - <<'PYLOCK'
-          import base64, gzip
-          data = base64.b64encode(gzip.compress(open('src-tauri/Cargo.lock','rb').read(), mtime=0)).decode()
-          for i in range(0, len(data), 30000):
-              print(f'::notice title=HorizonLock{i//30000:03d}::{data[i:i+30000]}')
-          PYLOCK
+      - name: Export lockfile part 1
+        run: python3 .github/scripts/expose-lock.py 0
+      - name: Export lockfile part 2
+        run: python3 .github/scripts/expose-lock.py 1
+      - name: Export lockfile part 3
+        run: python3 .github/scripts/expose-lock.py 2
       - uses: actions/upload-artifact@v4
         with:
           name: cargo-lock

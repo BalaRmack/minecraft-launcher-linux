@@ -22,7 +22,7 @@ modules:
   - name: horizon
     buildsystem: simple
     build-commands:
-      - cargo build --manifest-path src-tauri/Cargo.toml --release --offline --features custom-protocol
+      - cargo build --manifest-path src-tauri/Cargo.toml --release --offline --features custom-protocol,smoke-test
       - install -Dm755 src-tauri/target/release/horizon /app/bin/horizon
       - install -Dm644 packaging/flatpak/io.github.balarmack.horizon.desktop /app/share/applications/io.github.balarmack.horizon.desktop
       - install -Dm644 packaging/flatpak/io.github.balarmack.horizon.metainfo.xml /app/share/metainfo/io.github.balarmack.horizon.metainfo.xml

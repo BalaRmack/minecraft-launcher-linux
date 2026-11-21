@@ -1,5 +1,5 @@
 //! Managed Java runtimes. All network and process work is called on a blocking worker.
-use crate::{err, Result};
+use crate::{err, managed_child, Result};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::{
@@ -143,16 +143,17 @@ pub fn resolve(
     if java_major(Path::new("java")) == Some(major) {
         return Ok(PathBuf::from("java"));
     }
-    let runtimes = root.join("runtime");
-    fs::create_dir_all(&runtimes).map_err(err)?;
-    let dest = runtimes.join(format!("temurin-{major}"));
+    let runtimes = managed_child(root, "runtime", true)?;
+    let dest = managed_child(&runtimes, &format!("temurin-{major}"), false)?;
     let executable = dest.join("bin/java");
     if java_major(&executable) == Some(major) {
         return Ok(executable);
     }
     progress(&format!("Загрузка Java {major}"));
     let client = reqwest::blocking::Client::builder()
-        .user_agent("Horizon/0.1.0")
+        .user_agent(
+            "BalaRmack/Horizon/0.1.0 (https://github.com/BalaRmack/minecraft-launcher-linux)",
+        )
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(600))
         .build()

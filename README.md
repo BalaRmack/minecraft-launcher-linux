@@ -17,7 +17,7 @@
 
 ## Flatpak для Bazzite
 
-Подготовлены манифест и GitHub Actions workflow `Flatpak Linux`. Он собирает исходники офлайн внутри GNOME SDK 50 из предварительно скачанных Cargo-зависимостей, создаёт `horizon.flatpak`, устанавливает его и проверяет запуск `--version` в sandbox. Проверка `--version` **не означает**, что проверен запуск Minecraft или работа на Bazzite; смотрите результат workflow для конкретного коммита. Доступы ограничены сетью, Wayland/X11, графикой, аудио и IPC; доступ ко всему домашнему каталогу не выдаётся.
+Подготовлены манифест и GitHub Actions workflow `Flatpak Linux`. Он собирает исходники офлайн внутри GNOME SDK 50 из предварительно скачанных Cargo-зависимостей, создаёт `horizon.flatpak`, устанавливает его и проверяет запуск `--version` в sandbox. Для следующих сборок также настроены запуск окна и тест Java, Vanilla, Fabric и Sodium в sandbox под Xvfb. Смотрите результат каждого задания для конкретного коммита: такая проверка не равнозначна тестированию на Bazzite и реальном GPU. Доступы ограничены сетью, Wayland/X11, графикой, аудио и IPC; доступ ко всему домашнему каталогу не выдаётся.
 
 Если workflow **успешно завершился** и в нём опубликован артефакт `horizon-flatpak-x86_64`, скачайте и распакуйте его из GitHub Actions. На Bazzite установите Flathub, если он ещё не добавлен, а затем пакет:
 
@@ -43,7 +43,7 @@ npx --yes @tauri-apps/cli@2 dev
 npx --yes @tauri-apps/cli@2 build --bundles deb
 ```
 
-`.deb` предназначен для Debian/Ubuntu, не для установки на Bazzite. Для тестирования с реальной сетью, X11 и OpenGL подготовлен отдельный игнорируемый Rust-тест `live_minecraft_vanilla_and_fabric`: он загружает Java и Minecraft 1.20.1, проверяет повторное использование файлов, устанавливает Fabric и ожидает инициализацию LWJGL у обеих версий. На Linux с Xvfb:
+`.deb` предназначен для Debian/Ubuntu, не для установки на Bazzite. Для тестирования с реальной сетью, X11 и OpenGL подготовлен отдельный игнорируемый Rust-тест `live_minecraft_vanilla_and_fabric`: он принудительно загружает управляемую Java и Minecraft 1.20.1, проверяет повторное использование файлов, устанавливает Fabric и ожидает инициализацию LWJGL у обеих версий. На Linux с Xvfb:
 
 ```sh
 xvfb-run -a -s '-screen 0 1280x720x24' cargo test --manifest-path src-tauri/Cargo.toml live_minecraft_vanilla_and_fabric -- --ignored --nocapture

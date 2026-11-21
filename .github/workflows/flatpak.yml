@@ -15,7 +15,7 @@ jobs:
       - name: Install Flatpak builder
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak flatpak-builder
+          sudo apt-get install -y flatpak flatpak-builder xvfb xauth
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
       - name: Build offline in GNOME SDK sandbox
         run: .github/scripts/annotated.sh packaging/flatpak/build.sh
@@ -24,6 +24,15 @@ jobs:
           flatpak install --user -y --noninteractive ./horizon.flatpak
           flatpak run io.github.balarmack.horizon --version
           flatpak run --command=sh io.github.balarmack.horizon -c 'test -w "$HOME" && test -d /app && test -d /usr'
+      - name: Start the window in Flatpak under Xvfb
+        run: |
+          set +e
+          xvfb-run -a timeout 15s flatpak run --socket=x11 io.github.balarmack.horizon
+          code=$?
+          set -e
+          if [ "$code" -ne 124 ]; then echo "Window exited unexpectedly: $code"; exit 1; fi
+      - name: Install and launch game in Flatpak sandbox
+        run: .github/scripts/annotated.sh xvfb-run -a -s '-screen 0 1280x720x24' flatpak run --socket=x11 io.github.balarmack.horizon --smoke-test
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-flatpak-x86_64

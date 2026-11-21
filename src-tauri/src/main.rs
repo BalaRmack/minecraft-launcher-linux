@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod java;
 mod modrinth;
+#[cfg(any(test, feature = "smoke-test"))]
+mod smoke;
 use mc_launcher_core::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -113,9 +115,28 @@ fn profile(c: &Connection, id: &str) -> Result<Profile> {
     )
     .map_err(err)
 }
+// Reject symlinked managed directories instead of following them outside the app data tree.
+fn managed_child(parent: &std::path::Path, name: &str, create: bool) -> Result<PathBuf> {
+    let path = parent.join(name);
+    if create {
+        match fs::create_dir(&path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(err(e)),
+        }
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_dir() => (),
+        Ok(_) => return Err("Каталог сборки является ссылкой или не является каталогом".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => (),
+        Err(e) => return Err(err(e)),
+    }
+    Ok(path)
+}
 fn profile_dir(app: &tauri::AppHandle, id: &str) -> Result<PathBuf> {
     Uuid::parse_str(id).map_err(err)?;
-    Ok(root(app)?.join("instances").join(id))
+    let instances = managed_child(&root(app)?, "instances", true)?;
+    managed_child(&instances, id, false)
 }
 fn offline_uuid(name: &str) -> String {
     let mut bytes = md5::compute(format!("OfflinePlayer:{name}")).0;
@@ -365,7 +386,9 @@ fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<()> {
 }
 fn client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
-        .user_agent("Horizon/0.1.0 (Minecraft launcher)")
+        .user_agent(
+            "BalaRmack/Horizon/0.1.0 (https://github.com/BalaRmack/minecraft-launcher-linux)",
+        )
         .timeout(std::time::Duration::from_secs(45))
         .build()
         .map_err(err)
@@ -416,7 +439,11 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
         let c = db(&app)?;
         let p = profile(&c, &id)?;
         let dir = profile_dir(&app, &id)?;
-        fs::create_dir_all(&dir).map_err(err)?;
+        let dir = managed_child(
+            dir.parent().ok_or("Некорректный каталог сборки")?,
+            &id,
+            true,
+        )?;
         let metadata =
             mc_launcher_core::install::client::fetch_vanilla_version(&p.version).map_err(err)?;
         let major = metadata
@@ -459,16 +486,27 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
         c.execute("UPDATE profiles SET installed_id=NULL WHERE id=?1", [&id])
             .map_err(err)?;
         let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut completed = 0usize;
+        let mut reused = 0usize;
         let mut progress = |ev: ProgressEvent| {
-            if last.elapsed() >= std::time::Duration::from_millis(250) {
-                match ev {
-                    ProgressEvent::TaskStarted { label, .. }
-                    | ProgressEvent::TaskFinished { label } => {
-                        let _ = app.emit("install-progress", label);
-                        last = std::time::Instant::now();
-                    }
-                    _ => {}
+            let label = match ev {
+                ProgressEvent::TaskStarted { label, .. } => label,
+                ProgressEvent::TaskFinished { label } => {
+                    completed += 1;
+                    label
                 }
+                ProgressEvent::TaskSkipped { label, .. } => {
+                    reused += 1;
+                    label
+                }
+                _ => return,
+            };
+            if last.elapsed() >= std::time::Duration::from_millis(250) {
+                let _ = app.emit(
+                    "install-progress",
+                    format!("{label} · загружено {completed} · из кэша {reused}"),
+                );
+                last = std::time::Instant::now();
             }
         };
         let result = Launcher::new(dir)
@@ -504,8 +542,7 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             .query_row("SELECT name FROM accounts WHERE id=?1", [aid], |r| r.get(0))
             .map_err(err)?;
         let dir = profile_dir(&app, &id)?;
-        let game = dir.join("game");
-        fs::create_dir_all(&game).map_err(err)?;
+        let game = managed_child(&dir, "game", true)?;
         let launcher = Launcher::new(&dir);
         let version = launcher.load_version(&vid).map_err(err)?;
         let base = launcher.load_version(&p.version).map_err(err)?;
@@ -587,9 +624,8 @@ fn game_log(app: tauri::AppHandle, id: String) -> Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let c = db(&app)?;
     profile(&c, &id)?;
-    let path = profile_dir(&app, &id)?
-        .join("game")
-        .join("horizon-game.log");
+    let dir = profile_dir(&app, &id)?;
+    let path = managed_child(&dir, "game", false)?.join("horizon-game.log");
     let mut f = fs::File::open(path).map_err(err)?;
     let size = f.metadata().map_err(err)?.len();
     f.seek(SeekFrom::Start(size.saturating_sub(65536)))
@@ -606,9 +642,10 @@ struct ModFile {
 fn mods_dir(app: &tauri::AppHandle, id: &str) -> Result<PathBuf> {
     let c = db(app)?;
     profile(&c, id)?;
-    let p = profile_dir(app, id)?.join("game").join("mods");
-    fs::create_dir_all(&p).map_err(err)?;
-    Ok(p)
+    let dir = profile_dir(app, id)?;
+    let dir = managed_child(dir.parent().ok_or("Некорректный каталог сборки")?, id, true)?;
+    let game = managed_child(&dir, "game", true)?;
+    managed_child(&game, "mods", true)
 }
 fn safe_mod_name(name: &str) -> bool {
     !name.is_empty()
@@ -737,6 +774,11 @@ async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Resu
     .map_err(err)?
 }
 fn main() {
+    #[cfg(feature = "smoke-test")]
+    if std::env::args().nth(1).as_deref() == Some("--smoke-test") {
+        smoke::run();
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("Horizon {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -805,6 +847,15 @@ mod tests {
         assert!(p.java.is_none() && p.memory_mb.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_directories_reject_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/tmp", temp.path().join("escape")).unwrap();
+        assert!(managed_child(temp.path(), "escape", true).is_err());
+        assert!(managed_child(temp.path(), "escape", false).is_err());
+    }
+
     #[test]
     fn instance_copy_is_independent() {
         let temp = tempfile::tempdir().unwrap();
@@ -870,98 +921,9 @@ mod tests {
         worker.join().unwrap();
     }
 
-    /// Live smoke test: deliberately ignored by `cargo test` because it downloads
-    /// Minecraft and Java and requires a working X display and OpenGL.
     #[test]
     #[ignore]
     fn live_minecraft_vanilla_and_fabric() {
-        use std::time::{Duration, Instant};
-        let temp = tempfile::tempdir().unwrap();
-        let java = java::resolve(temp.path(), "auto", 17, |s| eprintln!("{s}")).unwrap();
-        let root = temp.path().join("minecraft");
-        let launcher = Launcher::new(&root);
-        let vanilla = launcher.install(InstallRequest::vanilla("1.20.1")).unwrap();
-        let mut skipped = 0usize;
-        launcher
-            .install_with_progress(InstallRequest::vanilla("1.20.1"), &mut |event| {
-                if matches!(event, ProgressEvent::TaskSkipped { .. }) {
-                    skipped += 1;
-                }
-            })
-            .unwrap();
-        assert!(
-            skipped > 100,
-            "verified libraries and assets should be reused"
-        );
-        let fabric = launcher
-            .install_with_progress_and_java(
-                InstallRequest {
-                    minecraft_version: "1.20.1".into(),
-                    loader: Some(LoaderSpec::Fabric {
-                        version: LoaderVersion::LatestStable,
-                    }),
-                    java: JavaInstallPolicy::Never,
-                },
-                &mut |_e| {},
-                &java,
-            )
-            .unwrap();
-        for (number, installed) in [vanilla, fabric].into_iter().enumerate() {
-            let game = temp.path().join(format!("game-{number}"));
-            fs::create_dir_all(&game).unwrap();
-            if number == 1 {
-                let count =
-                    modrinth::install(&game.join("mods"), "sodium", "1.20.1", "fabric", |s| {
-                        eprintln!("{s}")
-                    })
-                    .unwrap();
-                assert!(count > 0);
-            }
-            let version = launcher.load_version(&installed.version_id).unwrap();
-            let command = launcher
-                .build_launch_command_from_version(
-                    &version,
-                    LaunchOptions {
-                        account: Account::Offline {
-                            username: "HorizonSmoke".into(),
-                            uuid: offline_uuid("HorizonSmoke"),
-                        },
-                        java_executable: Some(java.clone()),
-                        game_directory: Some(game.clone()),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let output = fs::File::create(game.join("process.log")).unwrap();
-            let mut child = Command::new(command.executable)
-                .arg("-Xmx1024M")
-                .args(command.args)
-                .envs(command.env)
-                .current_dir(command.working_dir)
-                .stdout(Stdio::from(output.try_clone().unwrap()))
-                .stderr(Stdio::from(output))
-                .spawn()
-                .unwrap();
-            let start = Instant::now();
-            let success = loop {
-                let log = fs::read_to_string(game.join("logs/latest.log")).unwrap_or_default();
-                if log.contains("Backend library: LWJGL") {
-                    break true;
-                }
-                if child.try_wait().unwrap().is_some() || start.elapsed() > Duration::from_secs(180)
-                {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            };
-            let _ = child.kill();
-            let _ = child.wait();
-            if !success {
-                panic!(
-                    "Minecraft failed to reach LWJGL: {}",
-                    fs::read_to_string(game.join("process.log")).unwrap_or_default()
-                );
-            }
-        }
+        crate::smoke::run();
     }
 }

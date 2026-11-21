@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+smoke-test = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
