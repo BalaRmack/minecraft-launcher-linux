@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod catalog;
+mod integrity;
 mod java;
 mod modrinth;
 #[cfg(any(test, feature = "smoke-test"))]
@@ -8,11 +9,14 @@ use mc_launcher_core::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
@@ -25,6 +29,116 @@ fn err(e: impl std::fmt::Display) -> String {
 struct Tasks(Mutex<HashSet<String>>);
 #[derive(Default)]
 struct RuntimeLock(Mutex<()>);
+#[derive(Default)]
+struct Installations(Mutex<HashMap<String, Arc<AtomicBool>>>);
+struct InstallationGuard {
+    app: tauri::AppHandle,
+    id: String,
+}
+impl Drop for InstallationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.app.state::<Installations>().0.lock() {
+            m.remove(&self.id);
+        }
+    }
+}
+struct InstallProgress {
+    app: tauri::AppHandle,
+    id: String,
+    cancel: Arc<AtomicBool>,
+    last: std::time::Instant,
+    completed: usize,
+    reused: usize,
+}
+impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
+    fn report(&mut self, ev: ProgressEvent) {
+        let label = match ev {
+            ProgressEvent::TaskStarted { label, .. } => label,
+            ProgressEvent::TaskFinished { label } => {
+                self.completed += 1;
+                label
+            }
+            ProgressEvent::TaskSkipped { label, .. } => {
+                self.reused += 1;
+                label
+            }
+            _ => return,
+        };
+        if self.last.elapsed() >= std::time::Duration::from_millis(250) {
+            emit_install(
+                &self.app,
+                &self.id,
+                &format!(
+                    "{label} · загружено {} · из кэша {}",
+                    self.completed, self.reused
+                ),
+            );
+            self.last = std::time::Instant::now();
+        }
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+fn emit_install(app: &tauri::AppHandle, id: &str, message: &str) {
+    let _ = app.emit(
+        "profile-progress",
+        serde_json::json!({"id":id,"message":message}),
+    );
+}
+#[tauri::command]
+fn cancel_install(app: tauri::AppHandle, id: String) -> Result<()> {
+    let state = app.state::<Installations>();
+    let guard = state.0.lock().map_err(err)?;
+    let token = guard.get(&id).ok_or("Установка уже завершена")?;
+    token.store(true, Ordering::Relaxed);
+    emit_install(&app, &id, "Ожидание завершения текущей операции…");
+    Ok(())
+}
+#[derive(Serialize)]
+struct ProfileStatus {
+    state: &'static str,
+    reason: Option<String>,
+    path: String,
+}
+fn actual_status(dir: &std::path::Path, installed: Option<&str>) -> ProfileStatus {
+    let path = dir.join("game").to_string_lossy().to_string();
+    match installed {
+        None => ProfileStatus {
+            state: if dir.join(".horizon-installing").exists() || dir.join("versions").exists() {
+                "broken"
+            } else {
+                "not_installed"
+            },
+            reason: None,
+            path,
+        },
+        Some(id) => match integrity::verify(dir, id) {
+            Ok(()) => ProfileStatus {
+                state: "ready",
+                reason: None,
+                path,
+            },
+            Err(e) => ProfileStatus {
+                state: "broken",
+                reason: Some(e),
+                path,
+            },
+        },
+    }
+}
+#[tauri::command]
+async fn profile_status(app: tauri::AppHandle, id: String) -> Result<ProfileStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy = acquire(&app, &id)?;
+        let c = db(&app)?;
+        let p = profile(&c, &id)?;
+        let dir = profile_dir(&app, &id)?;
+        Ok(actual_status(&dir, p.installed_id.as_deref()))
+    })
+    .await
+    .map_err(err)?
+}
 #[derive(Serialize, Deserialize, Clone)]
 struct AccountRow {
     id: String,
@@ -497,8 +611,19 @@ fn acquire(app: &tauri::AppHandle, id: &str) -> Result<Busy> {
 #[tauri::command]
 async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
     let busy = acquire(&app, &id)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.state::<Installations>()
+        .0
+        .lock()
+        .map_err(err)?
+        .insert(id.clone(), cancel.clone());
+    let installation = InstallationGuard {
+        app: app.clone(),
+        id: id.clone(),
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let _busy = busy;
+        let _installation = installation;
         let c = db(&app)?;
         let p = profile(&c, &id)?;
         let dir = profile_dir(&app, &id)?;
@@ -507,8 +632,16 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             &id,
             true,
         )?;
+        fs::write(dir.join(".horizon-installing"), b"installation incomplete").map_err(err)?;
+        // Clear before any network or Java work so an interrupted repair is never ready.
+        c.execute("UPDATE profiles SET installed_id=NULL WHERE id=?1", [&id])
+            .map_err(err)?;
+        emit_install(&app, &id, "Получение метаданных Minecraft…");
         let metadata =
             mc_launcher_core::install::client::fetch_vanilla_version(&p.version).map_err(err)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Установка отменена".into());
+        }
         let major = metadata
             .java_version
             .as_ref()
@@ -526,10 +659,13 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
                     .unwrap_or_else(|| "auto".into()),
                 major,
                 |s| {
-                    let _ = app.emit("install-progress", s.to_string());
+                    emit_install(&app, &id, s);
                 },
             )?
         };
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Установка отменена".into());
+        }
         let loader = match p.loader.as_str() {
             "fabric" => Some(LoaderSpec::Fabric {
                 version: LoaderVersion::LatestStable,
@@ -545,34 +681,15 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             }),
             _ => None,
         };
-        // A failed reinstallation must not leave a profile marked as ready.
-        c.execute("UPDATE profiles SET installed_id=NULL WHERE id=?1", [&id])
-            .map_err(err)?;
-        let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let mut completed = 0usize;
-        let mut reused = 0usize;
-        let mut progress = |ev: ProgressEvent| {
-            let label = match ev {
-                ProgressEvent::TaskStarted { label, .. } => label,
-                ProgressEvent::TaskFinished { label } => {
-                    completed += 1;
-                    label
-                }
-                ProgressEvent::TaskSkipped { label, .. } => {
-                    reused += 1;
-                    label
-                }
-                _ => return,
-            };
-            if last.elapsed() >= std::time::Duration::from_millis(250) {
-                let _ = app.emit(
-                    "install-progress",
-                    format!("{label} · загружено {completed} · из кэша {reused}"),
-                );
-                last = std::time::Instant::now();
-            }
+        let mut progress = InstallProgress {
+            app: app.clone(),
+            id: id.clone(),
+            cancel: cancel.clone(),
+            last: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            completed: 0,
+            reused: 0,
         };
-        let result = Launcher::new(dir)
+        let result = Launcher::new(&dir)
             .install_with_progress_and_java(
                 InstallRequest {
                     minecraft_version: p.version,
@@ -583,11 +700,20 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
                 &java,
             )
             .map_err(err)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Установка отменена".into());
+        }
+        emit_install(&app, &id, "Проверка установленных файлов…");
+        integrity::verify(&dir, &result.version_id)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Установка отменена".into());
+        }
         c.execute(
             "UPDATE profiles SET installed_id=?1 WHERE id=?2",
             params![result.version_id, id],
         )
         .map_err(err)?;
+        let _ = fs::remove_file(dir.join(".horizon-installing"));
         Ok(())
     })
     .await
@@ -599,12 +725,13 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
     tauri::async_runtime::spawn_blocking(move || {
         let c = db(&app)?;
         let p = profile(&c, &id)?;
-        let vid = p.installed_id.ok_or("Сначала установите профиль")?;
+        let vid = p.installed_id.clone().ok_or("Сначала установите профиль")?;
+        let dir = profile_dir(&app, &id)?;
+        integrity::verify(&dir, &vid).map_err(|e| format!("Сборку необходимо восстановить: {e}"))?;
         let aid = get(&c, "active_account")?.ok_or("Выберите офлайн-аккаунт")?;
         let name: String = c
             .query_row("SELECT name FROM accounts WHERE id=?1", [aid], |r| r.get(0))
             .map_err(err)?;
-        let dir = profile_dir(&app, &id)?;
         let game = managed_child(&dir, "game", true)?;
         let launcher = Launcher::new(&dir);
         let version = launcher.load_version(&vid).map_err(err)?;
@@ -893,6 +1020,7 @@ fn main() {
         .manage(Tasks::default())
         .manage(catalog::Cache::default())
         .manage(RuntimeLock::default())
+        .manage(Installations::default())
         .invoke_handler(tauri::generate_handler![
             snapshot,
             save_account,
@@ -907,6 +1035,8 @@ fn main() {
             save_settings,
             versions,
             install_profile,
+            cancel_install,
+            profile_status,
             launch_profile,
             game_log,
             list_mods,

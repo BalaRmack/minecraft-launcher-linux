@@ -89,10 +89,20 @@ impl Launcher {
         reporter: &mut dyn ProgressReporter,
         java_executable: &Path,
     ) -> Result<InstallResult> {
+        if reporter.is_cancelled() {
+            return Err(crate::LauncherError::Other {
+                message: "Установка отменена".into(),
+            });
+        }
         if let Some(loader) = request.loader.clone() {
             match loader {
                 LoaderSpec::Fabric { version } => {
                     self.install_vanilla_version(&request.minecraft_version, reporter)?;
+                    if reporter.is_cancelled() {
+                        return Err(crate::LauncherError::Other {
+                            message: "Установка отменена".into(),
+                        });
+                    }
                     let loader_version = resolve_fabric_loader_version(version)?;
                     let profile = crate::loader::fabric::fetch_profile(
                         &request.minecraft_version,
@@ -106,6 +116,11 @@ impl Launcher {
                 }
                 LoaderSpec::Quilt { version } => {
                     self.install_vanilla_version(&request.minecraft_version, reporter)?;
+                    if reporter.is_cancelled() {
+                        return Err(crate::LauncherError::Other {
+                            message: "Установка отменена".into(),
+                        });
+                    }
                     let loader_version = resolve_quilt_loader_version(version)?;
                     let profile = crate::loader::quilt::fetch_profile(
                         &request.minecraft_version,
@@ -119,6 +134,11 @@ impl Launcher {
                 }
                 LoaderSpec::Forge { version } => {
                     self.install_vanilla_version(&request.minecraft_version, reporter)?;
+                    if reporter.is_cancelled() {
+                        return Err(crate::LauncherError::Other {
+                            message: "Установка отменена".into(),
+                        });
+                    }
                     let loader_version =
                         resolve_forge_loader_version(&request.minecraft_version, version)?;
                     let installer_path = download_installer(
@@ -141,6 +161,11 @@ impl Launcher {
                 }
                 LoaderSpec::NeoForge { version } => {
                     self.install_vanilla_version(&request.minecraft_version, reporter)?;
+                    if reporter.is_cancelled() {
+                        return Err(crate::LauncherError::Other {
+                            message: "Установка отменена".into(),
+                        });
+                    }
                     let loader_version =
                         resolve_neoforge_loader_version(&request.minecraft_version, version)?;
                     let installer_path = download_installer(

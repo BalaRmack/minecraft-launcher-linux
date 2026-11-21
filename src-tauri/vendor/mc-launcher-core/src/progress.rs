@@ -76,6 +76,10 @@ pub enum ProgressEvent {
 pub trait ProgressReporter {
     /// Handles a progress event.
     fn report(&mut self, event: ProgressEvent);
+    /// Whether the caller has requested cooperative cancellation.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 impl<F> ProgressReporter for F

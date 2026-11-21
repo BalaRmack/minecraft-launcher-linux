@@ -1,5 +1,5 @@
 //! Opt-in live integration probe. Downloads real game files into a temporary directory.
-use crate::{catalog, java, modrinth, offline_uuid};
+use crate::{catalog, integrity, java, modrinth, offline_uuid};
 use mc_launcher_core::prelude::*;
 use std::{
     fs,
@@ -52,6 +52,7 @@ pub fn run() {
         )
         .unwrap();
     for (number, installed) in [vanilla, fabric].into_iter().enumerate() {
+        integrity::verify(&root, &installed.version_id).unwrap();
         let game = temp.path().join(format!("game-{number}"));
         fs::create_dir_all(&game).unwrap();
         if number == 1 {

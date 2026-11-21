@@ -67,6 +67,11 @@ pub fn should_skip_existing(task: &DownloadTask) -> Result<bool> {
 pub fn execute_plan(plan: &DownloadPlan, reporter: &mut dyn ProgressReporter) -> Result<()> {
     let client = super::http::client()?;
     for task in &plan.tasks {
+        if reporter.is_cancelled() {
+            return Err(LauncherError::Other {
+                message: "Установка отменена".into(),
+            });
+        }
         if should_skip_existing(task)? {
             reporter.report(ProgressEvent::TaskSkipped {
                 label: task.label.clone(),
@@ -134,6 +139,11 @@ pub fn execute_plan(plan: &DownloadPlan, reporter: &mut dyn ProgressReporter) ->
                     }
                 }
             }
+        }
+        if reporter.is_cancelled() {
+            return Err(LauncherError::Other {
+                message: "Установка отменена".into(),
+            });
         }
         if let Some(error) = last_error {
             return Err(error);
