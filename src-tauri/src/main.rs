@@ -140,7 +140,6 @@ impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
                 self.file_received = Some(received);
                 self.file_total = total.filter(|v| *v > 0);
             }
-            _ => return,
         }
         if boundary || self.last.elapsed() >= std::time::Duration::from_millis(250) {
             let done = self.completed + self.reused;

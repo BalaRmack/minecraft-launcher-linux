@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -72,6 +73,25 @@ pub fn installer_command_args(invocation: &InstallerInvocation) -> Vec<String> {
 /// Returns [`crate::LauncherError`] if the installer process cannot be started
 /// or exits with a non-zero status.
 pub fn run_loader_installer(invocation: &InstallerInvocation) -> Result<()> {
+    // Forge's client installer requires this file even for third-party launchers.
+    // Create it only when absent; never truncate an existing launcher profile.
+    fs::create_dir_all(&invocation.minecraft_dir)?;
+    let profile = invocation.minecraft_dir.join("launcher_profiles.json");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&profile)
+    {
+        Ok(mut file) => file.write_all(br#"{"profiles":{}}"#)?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !fs::symlink_metadata(&profile)?.file_type().is_file() {
+                return Err(LauncherError::Other {
+                    message: "launcher_profiles.json is not a regular file".into(),
+                });
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
     let status = Command::new(&invocation.java_executable)
         .args(installer_command_args(invocation))
         .status()?;
