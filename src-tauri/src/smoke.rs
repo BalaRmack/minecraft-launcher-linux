@@ -58,7 +58,10 @@ pub fn run() {
             let backup = root.join("client-smoke-backup.jar");
             fs::rename(&jar, &backup).unwrap();
             assert!(integrity::verify(&root, &installed.version_id).is_err());
-            fs::rename(backup, jar).unwrap();
+            // Reinstallation must restore the missing file without deleting unrelated data.
+            launcher.install(InstallRequest::vanilla("1.20.1")).unwrap();
+            assert!(jar.is_file());
+            assert!(backup.is_file());
             integrity::verify(&root, &installed.version_id).unwrap();
         }
         let game = temp.path().join(format!("game-{number}"));

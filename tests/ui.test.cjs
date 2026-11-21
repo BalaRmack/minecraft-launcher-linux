@@ -66,3 +66,7 @@ test('installation shows real operation state and requests cancellation', async 
 test('broken files offer repair rather than play', async () => {
  const {dom,calls}=setup({profile_status:async()=>({state:'broken',reason:'Повреждён клиент',path:'/game'})});await tick();const d=dom.window.document;assert.match(d.querySelector('.build-card .build-play').textContent,/Восстановить/);assert.equal(d.querySelector('.build-card [data-action=play-profile]'),null);d.querySelector('[data-action=open-instance]').click();await tick();assert.match(d.querySelector('#instance-overview').textContent,/Повреждён клиент/);dom.window.close();
 });
+
+test('account selection and confirmed profile deletion call native commands', async () => {
+ const {dom,calls,snapshot}=setup();snapshot.accounts.push({id:'second',name:'Alex'});await tick();const d=dom.window.document;d.querySelector('[data-action=select-account][data-id=second]').click();await tick();assert.ok(calls.some(([name,args])=>name==='select_item'&&args.kind==='account'&&args.id==='second'));d.querySelector('[data-action=delete-profile]').click();await tick();assert.ok(calls.some(([name,args])=>name==='delete_profile'&&args.id==='profile-id'));dom.window.close();
+});

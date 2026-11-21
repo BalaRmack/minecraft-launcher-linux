@@ -1064,6 +1064,9 @@ async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Resu
         if p.installed_id.is_none() || p.loader == "vanilla" {
             return Err("Сначала установите сборку с загрузчиком модов".into());
         }
+        let dir = profile_dir(&app, &id)?;
+        integrity::verify(&dir, p.installed_id.as_deref().unwrap())
+            .map_err(|e| format!("Сначала восстановите сборку: {e}"))?;
         modrinth::install(
             &mods_dir(&app, &id)?,
             &project,
