@@ -330,6 +330,16 @@ pub fn install(
     loader: &str,
     progress: impl Fn(&str),
 ) -> Result<usize> {
+    install_with_cache(dir, project, minecraft, loader, None, progress)
+}
+pub fn install_with_cache(
+    dir: &Path,
+    project: &str,
+    minecraft: &str,
+    loader: &str,
+    cache: Option<&Path>,
+    progress: impl Fn(&str),
+) -> Result<usize> {
     let mut resolver = Resolver {
         client: client()?,
         api: "https://api.modrinth.com/v2".into(),
@@ -347,6 +357,7 @@ pub fn install(
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut names = HashMap::new();
     let mut downloads = Vec::new();
+    let mut cache_writes = Vec::new();
     for file in &resolver.files {
         let (name, url, hash) = metadata(file)?;
         if let Some(previous) = names.insert(name.to_string(), hash.to_string()) {
@@ -369,15 +380,52 @@ pub fn install(
         }
         progress(&format!("Мод: {name}"));
         let temp = stage.path().join(format!("{}", staged.len()));
-        downloads.push(ModDownload {
-            name: name.to_owned(),
-            url: url.to_owned(),
-            hash: hash.to_ascii_lowercase(),
-            temp: temp.clone(),
-        });
+        let cached = cache.map(|c| c.join(hash.to_ascii_lowercase()));
+        let from_cache = if let Some(path) = cached.as_ref() {
+            if fs::symlink_metadata(path)
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false)
+                && hash_file(path)
+                    .map(|h| h == hash.to_ascii_lowercase())
+                    .unwrap_or(false)
+            {
+                fs::copy(path, &temp).map_err(err)?;
+                if hash_file(&temp)? != hash.to_ascii_lowercase() {
+                    return Err("Повреждён файл кэша мода".into());
+                }
+                progress(&format!("Из кэша: {name}"));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !from_cache {
+            downloads.push(ModDownload {
+                name: name.to_owned(),
+                url: url.to_owned(),
+                hash: hash.to_ascii_lowercase(),
+                temp: temp.clone(),
+            });
+            if let Some(path) = cached {
+                cache_writes.push((temp.clone(), path));
+            }
+        }
         staged.push((temp, dest));
     }
     download_mods(downloads)?;
+    for (source, path) in cache_writes {
+        if let Some(dir) = path.parent() {
+            // Never link cached files to a profile: editing a mod in one instance must not alter another.
+            let _ = (|| -> std::io::Result<()> {
+                let temp = tempfile::NamedTempFile::new_in(dir)?;
+                fs::copy(source, temp.path())?;
+                temp.persist(path).map_err(|e| e.error)?;
+                Ok(())
+            })();
+        }
+    }
     let mut created = Vec::new();
     for (temp, dest) in staged {
         if let Err(e) = fs::hard_link(temp, &dest) {

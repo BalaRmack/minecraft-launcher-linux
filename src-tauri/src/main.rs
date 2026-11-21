@@ -1153,11 +1153,13 @@ async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Resu
         let dir = profile_dir(&app, &id)?;
         integrity::verify(&dir, p.installed_id.as_deref().unwrap())
             .map_err(|e| format!("Сначала восстановите сборку: {e}"))?;
-        modrinth::install(
+        let cache = managed_child(&root(&app)?, "modrinth-cache", true)?;
+        modrinth::install_with_cache(
             &mods_dir(&app, &id)?,
             &project,
             &p.version,
             &p.loader,
+            Some(&cache),
             |s| {
                 let _ = app.emit("install-progress", s.to_string());
             },

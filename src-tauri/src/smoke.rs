@@ -200,11 +200,34 @@ pub fn run() {
         let game = temp.path().join(format!("game-{number}"));
         fs::create_dir_all(&game).unwrap();
         if number == 1 {
-            let count = modrinth::install(&game.join("mods"), "sodium", "1.20.1", "fabric", |s| {
-                eprintln!("{s}")
-            })
+            let mod_cache = temp.path().join("mod-cache");
+            fs::create_dir(&mod_cache).unwrap();
+            let count = modrinth::install_with_cache(
+                &game.join("mods"),
+                "sodium",
+                "1.20.1",
+                "fabric",
+                Some(&mod_cache),
+                |s| eprintln!("{s}"),
+            )
             .unwrap();
             assert!(count > 0);
+            let from_cache = std::sync::atomic::AtomicBool::new(false);
+            let second_mods = temp.path().join("mod-cache-second-instance");
+            modrinth::install_with_cache(
+                &second_mods,
+                "sodium",
+                "1.20.1",
+                "fabric",
+                Some(&mod_cache),
+                |s| {
+                    if s.starts_with("Из кэша:") {
+                        from_cache.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            )
+            .unwrap();
+            assert!(from_cache.load(std::sync::atomic::Ordering::Relaxed));
             let mods_started = Instant::now();
             let lithium =
                 modrinth::install(&game.join("mods"), "lithium", "1.20.1", "fabric", |_| {})
