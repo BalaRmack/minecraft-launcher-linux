@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Horizon",
+  "version": "0.1.0",
+  "identifier": "io.github.balarmack.horizon",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Horizon",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 980,
+        "minHeight": 680
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' https://cdn.modrinth.com data:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb",
+      "appimage"
+    ],
+    "category": "Game",
+    "shortDescription": "Minecraft launcher for Linux",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}
