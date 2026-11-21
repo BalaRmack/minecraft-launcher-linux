@@ -1,6 +1,10 @@
 //! Download plans and execution.
 
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
 use crate::{
     io::hash::sha1_file,
@@ -104,7 +108,36 @@ pub fn execute_plan(plan: &DownloadPlan, reporter: &mut dyn ProgressReporter) ->
                 let mut response = client.get(&task.url).send()?.error_for_status()?;
                 // Write beside the destination; only promote a fully received and verified file.
                 let mut file = tempfile::NamedTempFile::new_in(parent)?;
-                io::copy(&mut response, &mut file)?;
+                let total = response.content_length();
+                let mut received = 0u64;
+                let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                let mut buf = [0u8; 65536];
+                loop {
+                    if reporter.is_cancelled() {
+                        return Err(LauncherError::Other {
+                            message: "Установка отменена".into(),
+                        });
+                    }
+                    let count = response.read(&mut buf)?;
+                    if count == 0 {
+                        break;
+                    }
+                    file.write_all(&buf[..count])?;
+                    received += count as u64;
+                    if last.elapsed() >= std::time::Duration::from_millis(250) {
+                        reporter.report(ProgressEvent::BytesReceived {
+                            label: task.label.clone(),
+                            received,
+                            total,
+                        });
+                        last = std::time::Instant::now();
+                    }
+                }
+                if reporter.is_cancelled() {
+                    return Err(LauncherError::Other {
+                        message: "Установка отменена".into(),
+                    });
+                }
                 let actual = match &task.checksum {
                     Some(Checksum::Sha1(_)) => Some(sha1_file(file.path())?),
                     Some(Checksum::Sha256(_)) => Some(sha256_file(file.path())?),
@@ -134,6 +167,9 @@ pub fn execute_plan(plan: &DownloadPlan, reporter: &mut dyn ProgressReporter) ->
                 }
                 Err(e) => {
                     last_error = Some(e);
+                    if reporter.is_cancelled() {
+                        break;
+                    }
                     if attempt < 2 {
                         std::thread::sleep(std::time::Duration::from_millis(400 * (attempt + 1)));
                     }

@@ -5,14 +5,14 @@ const { JSDOM } = require('jsdom');
 const html = fs.readFileSync('ui/index.html', 'utf8');
 const script = fs.readFileSync('ui/app.js', 'utf8');
 const tick = () => new Promise(resolve => setTimeout(resolve, 20));
-function setup() {
+function setup(overrides = {}) {
   const calls = [], listeners = {};
   const snapshot = { accounts: [{id:'account-id',name:'Steve'}], profiles: [{id:'profile-id',name:'<img src=x onerror=alert(1)>',version:'1.21.4',loader:'fabric',installed_id:'fabric-1.21.4'}], active_account:'account-id',active_profile:'profile-id',settings:{java:'java',memory_mb:2048} };
   const dom = new JSDOM(html, {runScripts:'outside-only',url:'https://horizon.local'});
   dom.window.confirm = () => true;
   dom.window.HTMLDialogElement.prototype.showModal = function(){this.open=true};
   dom.window.HTMLDialogElement.prototype.close = function(){this.open=false};
-  dom.window.__TAURI__ = {core:{invoke:async (name,args) => {calls.push([name,args]); if(name==='snapshot')return snapshot; if(name==='versions')return [{id:'1.21.4',type:'release'},{id:'25w01a',type:'snapshot'},{id:'old',type:'old_beta'}]; if(name==='list_mods'||name==='inspect_mods'||name==='catalog_categories')return []; if(name==='catalog_search')return {hits:[{project_id:'abc',title:'Example',description:'mod',author:'Author',downloads:10}],total_hits:21}; return null;}},event:{listen:async (name, callback)=>{listeners[name]=callback;}}};
+  dom.window.__TAURI__ = {core:{invoke:async (name,args) => {calls.push([name,args]); if (overrides[name]) return overrides[name](args); if(name==='snapshot')return snapshot; if(name==='profile_status')return {state:'ready',path:'/game'}; if(name==='versions')return [{id:'1.21.4',type:'release'},{id:'25w01a',type:'snapshot'},{id:'old',type:'old_beta'}]; if(name==='list_mods'||name==='inspect_mods'||name==='catalog_categories')return []; if(name==='catalog_search')return {hits:[{project_id:'abc',title:'Example',description:'mod',author:'Author',downloads:10}],total_hits:21}; return null;}},event:{listen:async (name, callback)=>{listeners[name]=callback;}}};
   dom.window.eval(script);
   return {dom,calls,snapshot,listeners};
 }
@@ -39,9 +39,8 @@ test('deletion requires confirmation', async () => {
 });
 test('profile settings send overrides through native IPC', async () => {
  const {dom,calls}=setup(); await tick(); const d=dom.window.document;
- const dialog=d.querySelector('#profile-dialog'); dialog.showModal=()=>{}; dialog.close=()=>{};
- d.querySelector('[data-action="settings-profile"]').click(); await tick();
- const form=d.querySelector('#profile-settings-form'); form.elements.java.value='/usr/bin/java'; form.elements.memory_mb.value='4096';
+ d.querySelector('[data-action="open-instance"]').click(); await tick(); d.querySelector('[data-instance-tab=settings]').click();
+ const form=d.querySelector('#instance-settings-form'); form.elements.java.value='/usr/bin/java'; form.elements.memory_mb.value='4096';
  form.dispatchEvent(new dom.window.SubmitEvent('submit',{bubbles:true,cancelable:true,submitter:form.querySelector('button[type=submit]')})); await tick();
  const call=calls.find(x=>x[0]==='save_profile_settings'); assert.equal(call[1].id,'profile-id'); assert.equal(call[1].java,'/usr/bin/java'); assert.equal(call[1].memoryMb,4096); dom.window.close();
 });
@@ -56,4 +55,14 @@ test('wizard creates a profile using the custom version picker', async () => {
 });
 test('catalog filters by profile, paginates and opens installed tab', async () => {
  const {dom,calls}=setup(); await tick(); const d=dom.window.document;d.querySelector('[data-page=mods]').click();await tick();let call=calls.filter(x=>x[0]==='catalog_search').at(-1);assert.equal(call[1].params.version,'1.21.4');assert.equal(call[1].params.loader,'fabric');assert.equal(d.querySelectorAll('.mod-card').length,1);d.querySelector('#catalog-next').click();await tick();call=calls.filter(x=>x[0]==='catalog_search').at(-1);assert.equal(call[1].params.offset,20);d.querySelector('[data-mod-tab=installed]').click();await tick();assert.equal(calls.some(x=>x[0]==='inspect_mods'),true);dom.window.close();
+});
+
+test('profile page hosts mods and settings for the selected build', async () => {
+ const {dom,calls}=setup();await tick();const d=dom.window.document;d.querySelector('[data-action=open-instance]').click();await tick();assert.ok(d.querySelector('#instance.active'));assert.equal(d.querySelectorAll('.build-card .card-actions > .build-play').length,1);assert.match(d.querySelector('.build-card .build-play').textContent,/Играть/);d.querySelector('[data-instance-tab=mods]').click();await tick();assert.ok(d.querySelector('#instance-mods-slot #mods-workspace'));assert.equal(calls.find(x=>x[0]==='catalog_search')[1].params.loader,'fabric');d.querySelector('[data-instance-tab=settings]').click();assert.equal(d.querySelector('#instance-settings').classList.contains('hidden'),false);dom.window.close();
+});
+test('installation shows real operation state and requests cancellation', async () => {
+ let resolveInstall;let current='not_installed';const {dom,calls}=setup({profile_status:async()=>({state:current,path:'/game'}),install_profile:()=>new Promise(resolve=>{resolveInstall=resolve;})});await tick();const d=dom.window.document;assert.match(d.querySelector('.build-card .build-play').textContent,/Установить/);d.querySelector('.build-card [data-action=install]').click();await tick();assert.equal(d.querySelector('.build-card [data-action=play-profile]'),null);d.querySelector('.build-card [data-action=cancel-install]').click();await tick();assert.ok(calls.some(x=>x[0]==='cancel_install'&&x[1].id==='profile-id'));current='ready';resolveInstall();await tick();await tick();assert.match(d.querySelector('.build-card .build-play').textContent,/Играть/);dom.window.close();
+});
+test('broken files offer repair rather than play', async () => {
+ const {dom,calls}=setup({profile_status:async()=>({state:'broken',reason:'Повреждён клиент',path:'/game'})});await tick();const d=dom.window.document;assert.match(d.querySelector('.build-card .build-play').textContent,/Восстановить/);assert.equal(d.querySelector('.build-card [data-action=play-profile]'),null);d.querySelector('[data-action=open-instance]').click();await tick();assert.match(d.querySelector('#instance-overview').textContent,/Повреждён клиент/);dom.window.close();
 });

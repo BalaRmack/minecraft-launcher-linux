@@ -53,6 +53,14 @@ pub fn run() {
         .unwrap();
     for (number, installed) in [vanilla, fabric].into_iter().enumerate() {
         integrity::verify(&root, &installed.version_id).unwrap();
+        if number == 0 {
+            let jar = root.join("versions/1.20.1/1.20.1.jar");
+            let backup = root.join("client-smoke-backup.jar");
+            fs::rename(&jar, &backup).unwrap();
+            assert!(integrity::verify(&root, &installed.version_id).is_err());
+            fs::rename(backup, jar).unwrap();
+            integrity::verify(&root, &installed.version_id).unwrap();
+        }
         let game = temp.path().join(format!("game-{number}"));
         fs::create_dir_all(&game).unwrap();
         if number == 1 {

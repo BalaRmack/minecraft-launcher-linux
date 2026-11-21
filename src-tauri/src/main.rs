@@ -62,6 +62,18 @@ impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
                 self.reused += 1;
                 label
             }
+            ProgressEvent::BytesReceived {
+                label,
+                received,
+                total,
+            } => match total.filter(|n| *n > 0) {
+                Some(total) => format!(
+                    "{} · текущий файл {}%",
+                    label,
+                    received.saturating_mul(100) / total
+                ),
+                None => format!("{} · {} КБ", label, received / 1024),
+            },
             _ => return,
         };
         if self.last.elapsed() >= std::time::Duration::from_millis(250) {
@@ -155,6 +167,9 @@ struct Profile {
     memory_mb: Option<u32>,
     last_played: Option<String>,
     mod_count: usize,
+    jvm_args: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -187,6 +202,9 @@ fn init_db(c: &Connection) -> Result<()> {
         ("java", "TEXT"),
         ("memory_mb", "INTEGER"),
         ("last_played", "TEXT"),
+        ("jvm_args", "TEXT"),
+        ("width", "INTEGER"),
+        ("height", "INTEGER"),
     ] {
         let has_column = || -> Result<bool> {
             c.query_row(
@@ -220,7 +238,7 @@ fn set(c: &Connection, k: &str, v: &str) -> Result<()> {
 }
 fn profile(c: &Connection, id: &str) -> Result<Profile> {
     c.query_row(
-        "SELECT id,name,version,loader,installed_id,java,memory_mb,last_played FROM profiles WHERE id=?1",
+        "SELECT id,name,version,loader,installed_id,java,memory_mb,last_played,jvm_args,width,height FROM profiles WHERE id=?1",
         [id],
         |r| {
             Ok(Profile {
@@ -233,6 +251,9 @@ fn profile(c: &Connection, id: &str) -> Result<Profile> {
                 memory_mb: r.get(6)?,
                 last_played: r.get(7)?,
                 mod_count: 0,
+                jvm_args: r.get(8)?,
+                width: r.get(9)?,
+                height: r.get(10)?,
             })
         },
     )
@@ -289,7 +310,7 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(err)?;
     let mut profiles = c
-        .prepare("SELECT id,name,version,loader,installed_id,java,memory_mb,last_played FROM profiles ORDER BY rowid")
+        .prepare("SELECT id,name,version,loader,installed_id,java,memory_mb,last_played,jvm_args,width,height FROM profiles ORDER BY rowid")
         .map_err(err)?
         .query_map([], |r| {
             Ok(Profile {
@@ -302,6 +323,9 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
                 memory_mb: r.get(6)?,
                 last_played: r.get(7)?,
                 mod_count: 0,
+                jvm_args: r.get(8)?,
+                width: r.get(9)?,
+                height: r.get(10)?,
             })
         })
         .map_err(err)?
@@ -494,8 +518,8 @@ async fn duplicate_profile(app: tauri::AppHandle, id: String, name: String) -> R
                 copy_instance(&src, &dest)?;
             }
             c.execute(
-                "INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![new_id, name, p.version, p.loader, p.installed_id, p.java, p.memory_mb],
+                "INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb,jvm_args,width,height) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![new_id, name, p.version, p.loader, p.installed_id, p.java, p.memory_mb, p.jvm_args, p.width, p.height],
             )
             .map_err(err)?;
             Ok(())
@@ -508,12 +532,41 @@ async fn duplicate_profile(app: tauri::AppHandle, id: String, name: String) -> R
     .await
     .map_err(err)?
 }
+// One argument per line; passed directly to Java, never via a shell.
+fn parse_jvm_args(text: &str) -> Result<Vec<String>> {
+    if text.len() > 4096 {
+        return Err("Слишком много аргументов JVM".into());
+    }
+    let mut result = Vec::new();
+    for line in text.lines() {
+        let arg = line.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        if result.len() >= 64
+            || !arg.starts_with('-')
+            || arg.chars().any(char::is_control)
+            || arg.starts_with("-Xmx")
+            || arg == "-cp"
+            || arg == "-classpath"
+            || arg == "--class-path"
+            || arg == "-jar"
+        {
+            return Err("Каждый аргумент JVM должен быть отдельной строкой; память и classpath настраиваются лаунчером".into());
+        }
+        result.push(arg.to_string());
+    }
+    Ok(result)
+}
 #[tauri::command]
 fn save_profile_settings(
     app: tauri::AppHandle,
     id: String,
     java: Option<String>,
     memory_mb: Option<u32>,
+    jvm_args: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
 ) -> Result<()> {
     let _busy = acquire(&app, &id)?;
     if memory_mb.is_some_and(|m| !(512..=65536).contains(&m))
@@ -523,11 +576,27 @@ fn save_profile_settings(
     {
         return Err("Укажите auto или путь к Java и память от 512 до 65536 МБ".into());
     }
+    if width.is_some() != height.is_some()
+        || width.is_some_and(|x| !(320..=7680).contains(&x))
+        || height.is_some_and(|x| !(240..=4320).contains(&x))
+    {
+        return Err("Укажите ширину и высоту окна в допустимых пределах".into());
+    }
+    if let Some(ref args) = jvm_args {
+        parse_jvm_args(args)?;
+    }
     let c = db(&app)?;
     profile(&c, &id)?;
     c.execute(
-        "UPDATE profiles SET java=?1, memory_mb=?2 WHERE id=?3",
-        params![java.map(|j| j.trim().to_string()), memory_mb, id],
+        "UPDATE profiles SET java=?1, memory_mb=?2, jvm_args=?3, width=?4, height=?5 WHERE id=?6",
+        params![
+            java.map(|j| j.trim().to_string()),
+            memory_mb,
+            jvm_args,
+            width,
+            height,
+            id
+        ],
     )
     .map_err(err)?;
     Ok(())
@@ -768,6 +837,7 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             game_directory: Some(game.clone()),
             launcher_name: "Horizon".into(),
             launcher_version: env!("CARGO_PKG_VERSION").into(),
+            custom_resolution: p.width.zip(p.height),
             ..Default::default()
         };
         let cmd = launcher
@@ -785,6 +855,7 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
         let log2 = log.try_clone().map_err(err)?;
         let mut child = Command::new(cmd.executable)
             .arg(format!("-Xmx{mem}M"))
+            .args(parse_jvm_args(p.jvm_args.as_deref().unwrap_or(""))?)
             .args(cmd.args)
             .envs(cmd.env)
             .current_dir(cmd.working_dir)
@@ -1070,6 +1141,26 @@ mod tests {
     }
 
     #[test]
+    fn installation_state_uses_files_and_interrupted_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(actual_status(temp.path(), None).state, "not_installed");
+        assert_eq!(actual_status(temp.path(), Some("missing")).state, "broken");
+        fs::write(temp.path().join(".horizon-installing"), b"incomplete").unwrap();
+        assert_eq!(actual_status(temp.path(), None).state, "broken");
+    }
+    #[test]
+    fn jvm_arguments_are_separate_and_do_not_override_managed_memory() {
+        assert_eq!(
+            parse_jvm_args("-XX:+UseG1GC\n-Dtest=hello world")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_jvm_args("-Xmx8G").is_err());
+        assert!(parse_jvm_args("-cp").is_err());
+        assert!(parse_jvm_args("java").is_err());
+    }
+    #[test]
     fn mod_filenames_cannot_escape_their_directory() {
         assert!(safe_mod_name("example.jar"));
         assert!(safe_mod_name("example.jar.disabled"));
@@ -1097,6 +1188,33 @@ mod tests {
         std::os::unix::fs::symlink("/tmp", temp.path().join("escape")).unwrap();
         assert!(managed_child(temp.path(), "escape", true).is_err());
         assert!(managed_child(temp.path(), "escape", false).is_err());
+    }
+
+    #[test]
+    fn cancelled_download_plan_stops_before_writing() {
+        use mc_launcher_core::{
+            net::download::{execute_plan, DownloadPlan, DownloadTask},
+            progress::ProgressReporter,
+        };
+        struct Cancelled;
+        impl ProgressReporter for Cancelled {
+            fn report(&mut self, _event: ProgressEvent) {}
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("file");
+        let plan = DownloadPlan {
+            tasks: vec![DownloadTask {
+                url: "http://127.0.0.1:1/no".into(),
+                destination: target.clone(),
+                checksum: None,
+                label: "test".into(),
+            }],
+        };
+        assert!(execute_plan(&plan, &mut Cancelled).is_err());
+        assert!(!target.exists());
     }
 
     #[test]
