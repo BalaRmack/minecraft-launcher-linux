@@ -443,6 +443,34 @@ fn install_inner(
     for (file, version) in resolver.files.iter().zip(&resolver.versions) {
         let (name, url, hash) = metadata(file)?;
         records.insert(hash.to_ascii_lowercase(), version.clone());
+        if version["project_id"] != target_id {
+            let matching: Vec<_> = local
+                .iter()
+                .filter(|f| {
+                    f.version
+                        .as_ref()
+                        .is_some_and(|v| v["project_id"] == version["project_id"])
+                })
+                .collect();
+            if matching.len() > 1 {
+                return Err("У зависимости найдено несколько файлов; проверьте Мои моды".into());
+            }
+            if let Some(file) = matching.first() {
+                if !file.name.ends_with(".jar") {
+                    return Err(
+                        "Необходимая зависимость отключена; включите её перед установкой".into(),
+                    );
+                }
+                if file
+                    .version
+                    .as_ref()
+                    .is_some_and(|v| v["id"] == version["id"] && v["id"].is_string())
+                {
+                    continue;
+                }
+                return Err("Другая версия зависимости уже установлена; проверьте Мои моды".into());
+            }
+        }
         if let Some(previous) = names.insert(name.to_string(), hash.to_string()) {
             if previous != hash {
                 return Err("Два мода имеют одинаковые имена файлов".into());
