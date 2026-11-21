@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod catalog;
 mod java;
 mod modrinth;
 #[cfg(any(test, feature = "smoke-test"))]
@@ -38,6 +39,8 @@ struct Profile {
     installed_id: Option<String>,
     java: Option<String>,
     memory_mb: Option<u32>,
+    last_played: Option<String>,
+    mod_count: usize,
 }
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -66,7 +69,11 @@ fn db(app: &tauri::AppHandle) -> Result<Connection> {
 }
 fn init_db(c: &Connection) -> Result<()> {
     c.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,version TEXT NOT NULL,loader TEXT NOT NULL,installed_id TEXT); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);").map_err(err)?;
-    for (column, declaration) in [("java", "TEXT"), ("memory_mb", "INTEGER")] {
+    for (column, declaration) in [
+        ("java", "TEXT"),
+        ("memory_mb", "INTEGER"),
+        ("last_played", "TEXT"),
+    ] {
         let has_column = || -> Result<bool> {
             c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('profiles') WHERE name=?1)",
@@ -99,7 +106,7 @@ fn set(c: &Connection, k: &str, v: &str) -> Result<()> {
 }
 fn profile(c: &Connection, id: &str) -> Result<Profile> {
     c.query_row(
-        "SELECT id,name,version,loader,installed_id,java,memory_mb FROM profiles WHERE id=?1",
+        "SELECT id,name,version,loader,installed_id,java,memory_mb,last_played FROM profiles WHERE id=?1",
         [id],
         |r| {
             Ok(Profile {
@@ -110,6 +117,8 @@ fn profile(c: &Connection, id: &str) -> Result<Profile> {
                 installed_id: r.get(4)?,
                 java: r.get(5)?,
                 memory_mb: r.get(6)?,
+                last_played: r.get(7)?,
+                mod_count: 0,
             })
         },
     )
@@ -165,8 +174,8 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
         .map_err(err)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(err)?;
-    let profiles = c
-        .prepare("SELECT id,name,version,loader,installed_id,java,memory_mb FROM profiles ORDER BY rowid")
+    let mut profiles = c
+        .prepare("SELECT id,name,version,loader,installed_id,java,memory_mb,last_played FROM profiles ORDER BY rowid")
         .map_err(err)?
         .query_map([], |r| {
             Ok(Profile {
@@ -177,11 +186,31 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
                 installed_id: r.get(4)?,
                 java: r.get(5)?,
                 memory_mb: r.get(6)?,
+                last_played: r.get(7)?,
+                mod_count: 0,
             })
         })
         .map_err(err)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(err)?;
+    for p in &mut profiles {
+        // Only count ordinary .jar files in this profile; missing folders are normal.
+        if let Ok(dir) = profile_dir(&app, &p.id) {
+            if let Ok(game) = managed_child(&dir, "game", false) {
+                if let Ok(mods) = managed_child(&game, "mods", false) {
+                    if let Ok(entries) = fs::read_dir(mods) {
+                        p.mod_count = entries
+                            .flatten()
+                            .filter(|e| {
+                                e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                                    && safe_mod_name(&e.file_name().to_string_lossy())
+                            })
+                            .count();
+                    }
+                }
+            }
+        }
+    }
     Ok(Snapshot {
         accounts,
         profiles,
@@ -278,6 +307,23 @@ fn create_profile(
     set(&c, "active_profile", &id)
 }
 #[tauri::command]
+fn rename_profile(app: tauri::AppHandle, id: String, name: String) -> Result<()> {
+    if !valid_name(&name) {
+        return Err("Некорректное название сборки".into());
+    }
+    let c = db(&app)?;
+    if c.execute(
+        "UPDATE profiles SET name=?1 WHERE id=?2",
+        params![name.trim(), id],
+    )
+    .map_err(err)?
+        == 0
+    {
+        return Err("Сборка не найдена".into());
+    }
+    Ok(())
+}
+#[tauri::command]
 fn delete_profile(app: tauri::AppHandle, tasks: State<Tasks>, id: String) -> Result<()> {
     let guard = tasks.0.lock().map_err(err)?;
     if guard.contains(&id) {
@@ -371,6 +417,23 @@ fn save_profile_settings(
     )
     .map_err(err)?;
     Ok(())
+}
+#[tauri::command]
+async fn open_profile_folder(app: tauri::AppHandle, id: String) -> Result<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let c = db(&app)?;
+        profile(&c, &id)?;
+        let dir = profile_dir(&app, &id)?;
+        let dir = managed_child(dir.parent().ok_or("Некорректный каталог")?, &id, true)?;
+        let game = managed_child(&dir, "game", true)?;
+        let status = Command::new("xdg-open").arg(game).status().map_err(err)?;
+        if !status.success() {
+            return Err(format!("Не удалось открыть папку: {status}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(err)?
 }
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<()> {
@@ -602,6 +665,8 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             .stderr(Stdio::from(log2))
             .spawn()
             .map_err(err)?;
+        // Record only after Java actually starts; a failed spawn must not change the date.
+        if let Err(e) = c.execute("UPDATE profiles SET last_played=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?1", [&id]) { eprintln!("Could not update last played: {e}"); }
         let a = app.clone();
         std::thread::spawn(move || {
             let status = child.wait();
@@ -702,6 +767,49 @@ fn change_mod(app: tauri::AppHandle, id: String, name: String, action: String) -
     Ok(())
 }
 #[tauri::command]
+async fn catalog_search(
+    app: tauri::AppHandle,
+    params: catalog::Search,
+) -> Result<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catalog::search(&app.state::<catalog::Cache>(), params)
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
+async fn catalog_categories(app: tauri::AppHandle) -> Result<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catalog::categories(&app.state::<catalog::Cache>())
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
+async fn catalog_details(
+    app: tauri::AppHandle,
+    project: String,
+    version: String,
+    loader: String,
+) -> Result<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || {
+        catalog::details(&app.state::<catalog::Cache>(), &project, &version, &loader)
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
+async fn inspect_mods(app: tauri::AppHandle, id: String) -> Result<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let c = db(&app)?;
+        let p = profile(&c, &id)?;
+        let dir = mods_dir(&app, &id)?;
+        catalog::inspect(&app.state::<catalog::Cache>(), &dir, &p.version, &p.loader)
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
 async fn search_mods(query: String) -> Result<serde_json::Value> {
     if query.len() > 100 {
         return Err("Слишком длинный запрос".into());
@@ -783,6 +891,7 @@ fn main() {
     }
     tauri::Builder::default()
         .manage(Tasks::default())
+        .manage(catalog::Cache::default())
         .manage(RuntimeLock::default())
         .invoke_handler(tauri::generate_handler![
             snapshot,
@@ -790,9 +899,11 @@ fn main() {
             delete_account,
             select_item,
             create_profile,
+            rename_profile,
             delete_profile,
             duplicate_profile,
             save_profile_settings,
+            open_profile_folder,
             save_settings,
             versions,
             install_profile,
@@ -801,6 +912,10 @@ fn main() {
             list_mods,
             change_mod,
             search_mods,
+            catalog_search,
+            catalog_categories,
+            catalog_details,
+            inspect_mods,
             mod_details,
             install_mod
         ])

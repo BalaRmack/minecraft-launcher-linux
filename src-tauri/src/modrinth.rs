@@ -132,7 +132,7 @@ impl Resolver<'_> {
         Ok(())
     }
 }
-fn hash_file(path: &Path) -> Result<String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).map_err(err)?;
     let mut hash = Sha512::new();
     let mut buf = [0u8; 65536];
