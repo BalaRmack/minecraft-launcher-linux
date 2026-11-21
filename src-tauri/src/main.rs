@@ -2,6 +2,7 @@
 mod catalog;
 mod integrity;
 mod java;
+mod loaders;
 mod modrinth;
 #[cfg(any(test, feature = "smoke-test"))]
 mod smoke;
@@ -54,27 +55,46 @@ struct InstallProgress {
     per_file: HashMap<String, u64>,
     batch_started: std::time::Instant,
     cache: PathBuf,
+    paths: HashMap<String, String>,
+    filename: String,
+    full_path: Option<String>,
+    file_received: Option<u64>,
+    file_total: Option<u64>,
+    downloaded_all: usize,
+    cached_all: usize,
 }
 impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
     fn report(&mut self, ev: ProgressEvent) {
-        let label = match ev {
+        match ev {
             ProgressEvent::BatchStarted { total } => {
                 self.completed = 0;
                 self.reused = 0;
                 self.total = total;
                 self.received = 0;
                 self.per_file.clear();
+                self.paths.clear();
+                self.filename.clear();
+                self.full_path = None;
+                self.file_received = None;
+                self.file_total = None;
                 self.batch_started = std::time::Instant::now();
-                format!("Новый этап: файлов {total}")
             }
-            ProgressEvent::TaskStarted { label, .. } => label,
+            ProgressEvent::TaskStarted { label, path } => {
+                self.paths
+                    .insert(label.clone(), path.to_string_lossy().to_string());
+                self.filename = label;
+                self.full_path = Some(path.to_string_lossy().to_string());
+                self.file_received = None;
+                self.file_total = None;
+            }
             ProgressEvent::TaskFinished { label } => {
                 self.completed += 1;
-                label
+                self.downloaded_all += 1;
+                self.paths.remove(&label);
             }
-            ProgressEvent::TaskSkipped { label, .. } => {
+            ProgressEvent::TaskSkipped { .. } => {
                 self.reused += 1;
-                label
+                self.cached_all += 1;
             }
             ProgressEvent::BytesReceived {
                 label,
@@ -87,21 +107,19 @@ impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
                 } else {
                     received
                 };
-                match total.filter(|n| *n > 0) {
-                    Some(total) => {
-                        format!("{} · файл {}%", label, received.saturating_mul(100) / total)
-                    }
-                    None => format!("{} · {} КБ", label, received / 1024),
-                }
+                self.filename = label.clone();
+                self.full_path = self.paths.get(&label).cloned();
+                self.file_received = Some(received);
+                self.file_total = total.filter(|v| *v > 0);
             }
             _ => return,
-        };
+        }
         if self.last.elapsed() >= std::time::Duration::from_millis(250) {
             let done = self.completed + self.reused;
             let speed = self.received as f64
                 / self.batch_started.elapsed().as_secs_f64().max(0.01)
                 / 1_000_000.0;
-            emit_install(&self.app, &self.id, &format!("{label} · этап {done}/{} · осталось {} · загружено {} · из кэша {} · {:.2} МБ/с",self.total,self.total.saturating_sub(done),self.completed,self.reused,speed));
+            let _=self.app.emit("profile-progress",serde_json::json!({"id":self.id,"message":"Установка Minecraft", "phase_done":done,"phase_total":self.total,"downloaded":self.downloaded_all,"cached":self.cached_all,"remaining_phase":self.total.saturating_sub(done),"speed_mbps":speed,"filename":self.filename,"path":self.full_path,"file_received":self.file_received,"file_total":self.file_total,"overall_percent":null}));
             self.last = std::time::Instant::now();
         }
     }
@@ -190,6 +208,7 @@ struct Profile {
     jvm_args: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    loader_version: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -225,6 +244,7 @@ fn init_db(c: &Connection) -> Result<()> {
         ("jvm_args", "TEXT"),
         ("width", "INTEGER"),
         ("height", "INTEGER"),
+        ("loader_version", "TEXT"),
     ] {
         let has_column = || -> Result<bool> {
             c.query_row(
@@ -258,7 +278,7 @@ fn set(c: &Connection, k: &str, v: &str) -> Result<()> {
 }
 fn profile(c: &Connection, id: &str) -> Result<Profile> {
     c.query_row(
-        "SELECT id,name,version,loader,installed_id,java,memory_mb,last_played,jvm_args,width,height FROM profiles WHERE id=?1",
+        "SELECT id,name,version,loader,installed_id,java,memory_mb,last_played,jvm_args,width,height,loader_version FROM profiles WHERE id=?1",
         [id],
         |r| {
             Ok(Profile {
@@ -274,6 +294,7 @@ fn profile(c: &Connection, id: &str) -> Result<Profile> {
                 jvm_args: r.get(8)?,
                 width: r.get(9)?,
                 height: r.get(10)?,
+                loader_version: r.get(11)?,
             })
         },
     )
@@ -330,7 +351,7 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(err)?;
     let mut profiles = c
-        .prepare("SELECT id,name,version,loader,installed_id,java,memory_mb,last_played,jvm_args,width,height FROM profiles ORDER BY rowid")
+        .prepare("SELECT id,name,version,loader,installed_id,java,memory_mb,last_played,jvm_args,width,height,loader_version FROM profiles ORDER BY rowid")
         .map_err(err)?
         .query_map([], |r| {
             Ok(Profile {
@@ -346,6 +367,7 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
                 jvm_args: r.get(8)?,
                 width: r.get(9)?,
                 height: r.get(10)?,
+                loader_version: r.get(11)?,
             })
         })
         .map_err(err)?
@@ -538,8 +560,8 @@ async fn duplicate_profile(app: tauri::AppHandle, id: String, name: String) -> R
                 copy_instance(&src, &dest)?;
             }
             c.execute(
-                "INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb,jvm_args,width,height) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![new_id, name, p.version, p.loader, p.installed_id, p.java, p.memory_mb, p.jvm_args, p.width, p.height],
+                "INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb,jvm_args,width,height,loader_version) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![new_id, name, p.version, p.loader, p.installed_id, p.java, p.memory_mb, p.jvm_args, p.width, p.height, p.loader_version],
             )
             .map_err(err)?;
             Ok(())
@@ -551,6 +573,69 @@ async fn duplicate_profile(app: tauri::AppHandle, id: String, name: String) -> R
     })
     .await
     .map_err(err)?
+}
+#[tauri::command]
+async fn available_loaders(
+    app: tauri::AppHandle,
+    id: String,
+    loader: String,
+) -> Result<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let c = db(&app)?;
+        let p = profile(&c, &id)?;
+        loaders::versions(&p.version, &loader)
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
+async fn preview_loader_mods(
+    app: tauri::AppHandle,
+    id: String,
+    loader: String,
+) -> Result<serde_json::Value> {
+    if !["vanilla", "fabric", "forge", "neoforge", "quilt"].contains(&loader.as_str()) {
+        return Err("Неизвестный загрузчик".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy = acquire(&app, &id)?;
+        let c = db(&app)?;
+        let p = profile(&c, &id)?;
+        let dir = mods_dir(&app, &id)?;
+        catalog::inspect(&app.state::<catalog::Cache>(), &dir, &p.version, &loader)
+    })
+    .await
+    .map_err(err)?
+}
+/// Copy first. Only the new profile is changed; original files are never touched.
+#[tauri::command]
+async fn copy_with_loader(
+    app: tauri::AppHandle,
+    id: String,
+    loader: String,
+    loader_version: Option<String>,
+    name: String,
+) -> Result<String> {
+    if !valid_name(&name) {
+        return Err("Некорректное название сборки".into());
+    }
+    let busy = acquire(&app, &id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy=busy;let c=db(&app)?;let p=profile(&c,&id)?;
+        if loader=="vanilla" { if loader_version.is_some() {return Err("Vanilla не использует версию загрузчика".into());} }
+        else {
+            let selected=loader_version.as_deref().ok_or("Выберите версию загрузчика")?;
+            if !loaders::versions(&p.version,&loader)?.iter().any(|v|v==selected) {return Err("Версия загрузчика не поддерживается выбранной версией Minecraft".into());}
+        }
+        let src=profile_dir(&app,&id)?;let new_id=Uuid::new_v4().to_string();let dest=profile_dir(&app,&new_id)?;
+        let result=(|| -> Result<()> {
+            if src.exists(){ copy_instance(&src,&dest)?; }
+            c.execute("INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb,jvm_args,width,height,loader_version) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9,?10)",params![new_id,name.trim(),p.version,loader,p.java,p.memory_mb,p.jvm_args,p.width,p.height,loader_version]).map_err(err)?;
+            set(&c,"active_profile",&new_id)?;Ok(())
+        })();
+        if let Err(e)=result {if dest.exists(){let _=fs::remove_dir_all(dest);}return Err(e);}
+        Ok(new_id)
+    }).await.map_err(err)?
 }
 // One argument per line; passed directly to Java, never via a shell.
 fn parse_jvm_args(text: &str) -> Result<Vec<String>> {
@@ -755,18 +840,23 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
         if cancel.load(Ordering::Relaxed) {
             return Err("Установка отменена".into());
         }
+        let selected_loader = p
+            .loader_version
+            .clone()
+            .map(LoaderVersion::Exact)
+            .unwrap_or(LoaderVersion::LatestStable);
         let loader = match p.loader.as_str() {
             "fabric" => Some(LoaderSpec::Fabric {
-                version: LoaderVersion::LatestStable,
+                version: selected_loader.clone(),
             }),
             "quilt" => Some(LoaderSpec::Quilt {
-                version: LoaderVersion::LatestStable,
+                version: selected_loader.clone(),
             }),
             "forge" => Some(LoaderSpec::Forge {
-                version: LoaderVersion::LatestStable,
+                version: selected_loader.clone(),
             }),
             "neoforge" => Some(LoaderSpec::NeoForge {
-                version: LoaderVersion::LatestStable,
+                version: selected_loader.clone(),
             }),
             _ => None,
         };
@@ -782,6 +872,13 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             per_file: HashMap::new(),
             batch_started: std::time::Instant::now(),
             cache: managed_child(&root(&app)?, "downloads-cache", true)?,
+            paths: HashMap::new(),
+            filename: String::new(),
+            full_path: None,
+            file_received: None,
+            file_total: None,
+            downloaded_all: 0,
+            cached_all: 0,
         };
         let result = Launcher::new(&dir)
             .install_with_progress_and_java(
@@ -1192,6 +1289,9 @@ fn main() {
             rename_profile,
             delete_profile,
             duplicate_profile,
+            available_loaders,
+            preview_loader_mods,
+            copy_with_loader,
             save_profile_settings,
             open_profile_folder,
             save_settings,
