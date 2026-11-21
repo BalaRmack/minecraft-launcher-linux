@@ -53,7 +53,7 @@ struct InstallProgress {
     total: usize,
     received: u64,
     per_file: HashMap<String, u64>,
-    batch_started: std::time::Instant,
+    speed_bytes: u64,
     cache: PathBuf,
     paths: HashMap<String, String>,
     filename: String,
@@ -65,6 +65,10 @@ struct InstallProgress {
 }
 impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
     fn report(&mut self, ev: ProgressEvent) {
+        let boundary = matches!(
+            &ev,
+            ProgressEvent::BatchStarted { .. } | ProgressEvent::StageStarted { .. }
+        );
         match ev {
             ProgressEvent::BatchStarted { total } => {
                 self.completed = 0;
@@ -77,7 +81,31 @@ impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
                 self.full_path = None;
                 self.file_received = None;
                 self.file_total = None;
-                self.batch_started = std::time::Instant::now();
+                self.speed_bytes = 0;
+            }
+            ProgressEvent::StageStarted { stage } => {
+                self.total = 0;
+                self.filename = match stage {
+                    mc_launcher_core::progress::InstallStage::ResolveVersion => {
+                        "Получение метаданных"
+                    }
+                    mc_launcher_core::progress::InstallStage::DownloadLibraries => {
+                        "Загрузка библиотек"
+                    }
+                    mc_launcher_core::progress::InstallStage::DownloadAssets => "Загрузка ресурсов",
+                    mc_launcher_core::progress::InstallStage::InstallRuntime => "Установка Java",
+                    mc_launcher_core::progress::InstallStage::ExtractNatives => {
+                        "Распаковка библиотек"
+                    }
+                    mc_launcher_core::progress::InstallStage::LoaderInstall => {
+                        "Установка загрузчика"
+                    }
+                    mc_launcher_core::progress::InstallStage::Verify => "Проверка файлов",
+                }
+                .to_owned();
+                self.full_path = None;
+                self.file_received = None;
+                self.file_total = None;
             }
             ProgressEvent::TaskStarted { label, path } => {
                 self.paths
@@ -114,11 +142,12 @@ impl mc_launcher_core::progress::ProgressReporter for InstallProgress {
             }
             _ => return,
         }
-        if self.last.elapsed() >= std::time::Duration::from_millis(250) {
+        if boundary || self.last.elapsed() >= std::time::Duration::from_millis(250) {
             let done = self.completed + self.reused;
-            let speed = self.received as f64
-                / self.batch_started.elapsed().as_secs_f64().max(0.01)
+            let speed = (self.received.saturating_sub(self.speed_bytes)) as f64
+                / self.last.elapsed().as_secs_f64().max(0.01)
                 / 1_000_000.0;
+            self.speed_bytes = self.received;
             let _=self.app.emit("profile-progress",serde_json::json!({"id":self.id,"message":"Установка Minecraft", "phase_done":done,"phase_total":self.total,"downloaded":self.downloaded_all,"cached":self.cached_all,"remaining_phase":self.total.saturating_sub(done),"speed_mbps":speed,"filename":self.filename,"path":self.full_path,"file_received":self.file_received,"file_total":self.file_total,"overall_percent":null}));
             self.last = std::time::Instant::now();
         }
@@ -621,19 +650,35 @@ async fn copy_with_loader(
     }
     let busy = acquire(&app, &id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let _busy=busy;let c=db(&app)?;let p=profile(&c,&id)?;
-        if loader=="vanilla" { if loader_version.is_some() {return Err("Vanilla не использует версию загрузчика".into());} }
-        else {
-            let selected=loader_version.as_deref().ok_or("Выберите версию загрузчика")?;
-            if !loaders::versions(&p.version,&loader)?.iter().any(|v|v==selected) {return Err("Версия загрузчика не поддерживается выбранной версией Minecraft".into());}
+        let _busy = busy;
+        let mut c = db(&app)?;
+        let p = profile(&c, &id)?;
+        if loader == "vanilla" {
+            if loader_version.is_some() { return Err("Vanilla не использует версию загрузчика".into()); }
+        } else {
+            let selected = loader_version.as_deref().ok_or("Выберите версию загрузчика")?;
+            if !loaders::versions(&p.version, &loader)?.iter().any(|v| v == selected) {
+                return Err("Версия загрузчика не поддерживается выбранной версией Minecraft".into());
+            }
         }
-        let src=profile_dir(&app,&id)?;let new_id=Uuid::new_v4().to_string();let dest=profile_dir(&app,&new_id)?;
-        let result=(|| -> Result<()> {
-            if src.exists(){ copy_instance(&src,&dest)?; }
-            c.execute("INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb,jvm_args,width,height,loader_version) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9,?10)",params![new_id,name.trim(),p.version,loader,p.java,p.memory_mb,p.jvm_args,p.width,p.height,loader_version]).map_err(err)?;
-            set(&c,"active_profile",&new_id)?;Ok(())
+        let src = profile_dir(&app, &id)?;
+        let new_id = Uuid::new_v4().to_string();
+        let dest = profile_dir(&app, &new_id)?;
+        let result = (|| -> Result<()> {
+            if src.exists() {
+                fs::create_dir_all(dest.parent().ok_or("Некорректный путь")?).map_err(err)?;
+                copy_instance(&src, &dest)?;
+            }
+            let tx = c.transaction().map_err(err)?;
+            tx.execute("INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb,jvm_args,width,height,loader_version) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9,?10)",params![new_id,name.trim(),p.version,loader,p.java,p.memory_mb,p.jvm_args,p.width,p.height,loader_version]).map_err(err)?;
+            set(&tx, "active_profile", &new_id)?;
+            tx.commit().map_err(err)?;
+            Ok(())
         })();
-        if let Err(e)=result {if dest.exists(){let _=fs::remove_dir_all(dest);}return Err(e);}
+        if let Err(e) = result {
+            if dest.exists() { let _ = fs::remove_dir_all(dest); }
+            return Err(e);
+        }
         Ok(new_id)
     }).await.map_err(err)?
 }
@@ -870,7 +915,7 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             total: 0,
             received: 0,
             per_file: HashMap::new(),
-            batch_started: std::time::Instant::now(),
+            speed_bytes: 0,
             cache: managed_child(&root(&app)?, "downloads-cache", true)?,
             paths: HashMap::new(),
             filename: String::new(),

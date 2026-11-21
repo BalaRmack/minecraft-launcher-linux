@@ -103,6 +103,9 @@ impl Launcher {
                             message: "Установка отменена".into(),
                         });
                     }
+                    reporter.report(crate::progress::ProgressEvent::StageStarted {
+                        stage: crate::progress::InstallStage::LoaderInstall,
+                    });
                     let loader_version = resolve_fabric_loader_version(version)?;
                     let profile = crate::loader::fabric::fetch_profile(
                         &request.minecraft_version,
@@ -121,6 +124,9 @@ impl Launcher {
                             message: "Установка отменена".into(),
                         });
                     }
+                    reporter.report(crate::progress::ProgressEvent::StageStarted {
+                        stage: crate::progress::InstallStage::LoaderInstall,
+                    });
                     let loader_version = resolve_quilt_loader_version(version)?;
                     let profile = crate::loader::quilt::fetch_profile(
                         &request.minecraft_version,
@@ -139,6 +145,9 @@ impl Launcher {
                             message: "Установка отменена".into(),
                         });
                     }
+                    reporter.report(crate::progress::ProgressEvent::StageStarted {
+                        stage: crate::progress::InstallStage::LoaderInstall,
+                    });
                     let loader_version =
                         resolve_forge_loader_version(&request.minecraft_version, version)?;
                     let installer_path = download_installer(
@@ -166,6 +175,9 @@ impl Launcher {
                             message: "Установка отменена".into(),
                         });
                     }
+                    reporter.report(crate::progress::ProgressEvent::StageStarted {
+                        stage: crate::progress::InstallStage::LoaderInstall,
+                    });
                     let loader_version =
                         resolve_neoforge_loader_version(&request.minecraft_version, version)?;
                     let installer_path = download_installer(

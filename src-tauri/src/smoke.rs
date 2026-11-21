@@ -1,5 +1,5 @@
 //! Opt-in live integration probe. Downloads real game files into a temporary directory.
-use crate::{catalog, integrity, java, modrinth, offline_uuid};
+use crate::{catalog, copy_instance, integrity, java, loaders, modrinth, offline_uuid};
 use mc_launcher_core::prelude::*;
 use std::{
     collections::HashMap,
@@ -322,5 +322,112 @@ pub fn run() {
                 fs::read_to_string(game.join("process.log")).unwrap_or_default()
             );
         }
+    }
+    // Exercise real isolated copies and exact loader installs, without ever editing the source.
+    let game = root.join("game");
+    fs::create_dir_all(game.join("saves/world")).unwrap();
+    fs::create_dir_all(game.join("mods")).unwrap();
+    fs::write(game.join("saves/world/marker"), b"world data").unwrap();
+    fs::write(game.join("mods/example.jar.disabled"), b"mod data").unwrap();
+    fs::write(game.join("options.txt"), b"settings").unwrap();
+    let mut source = root.clone();
+    for kind in ["forge", "fabric", "vanilla"] {
+        let dest = temp.path().join(format!("switch-{kind}"));
+        copy_instance(&source, &dest).unwrap();
+        let loader = match kind {
+            "forge" => Some(LoaderSpec::Forge {
+                version: LoaderVersion::Exact(
+                    loaders::versions("1.20.1", kind)
+                        .unwrap()
+                        .first()
+                        .expect("Forge version")
+                        .clone(),
+                ),
+            }),
+            "fabric" => Some(LoaderSpec::Fabric {
+                version: LoaderVersion::Exact(
+                    loaders::versions("1.20.1", kind)
+                        .unwrap()
+                        .first()
+                        .expect("Fabric version")
+                        .clone(),
+                ),
+            }),
+            _ => None,
+        };
+        let target = Launcher::new(&dest);
+        let mut metrics = Metrics::new(cache.clone());
+        let installed = target
+            .install_with_progress_and_java(
+                InstallRequest {
+                    minecraft_version: "1.20.1".into(),
+                    loader,
+                    java: JavaInstallPolicy::Never,
+                },
+                &mut metrics,
+                &java,
+            )
+            .unwrap();
+        integrity::verify(&dest, &installed.version_id).unwrap();
+        for dir in [&root, &dest] {
+            assert_eq!(
+                fs::read(dir.join("game/saves/world/marker")).unwrap(),
+                b"world data"
+            );
+            assert_eq!(
+                fs::read(dir.join("game/mods/example.jar.disabled")).unwrap(),
+                b"mod data"
+            );
+            assert_eq!(fs::read(dir.join("game/options.txt")).unwrap(), b"settings");
+        }
+        let version = target.load_version(&installed.version_id).unwrap();
+        let command = target
+            .build_launch_command_from_version(
+                &version,
+                LaunchOptions {
+                    account: Account::Offline {
+                        username: "HorizonSmoke".into(),
+                        uuid: offline_uuid("HorizonSmoke"),
+                    },
+                    java_executable: Some(java.clone()),
+                    game_directory: Some(dest.join("game")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let _ = fs::remove_dir_all(dest.join("game/logs"));
+        let log_file = fs::File::create(dest.join("game/switch-process.log")).unwrap();
+        let mut child = Command::new(command.executable)
+            .arg("-Xmx1024M")
+            .args(command.args)
+            .envs(command.env)
+            .current_dir(command.working_dir)
+            .stdout(Stdio::from(log_file.try_clone().unwrap()))
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let success = loop {
+            let log = fs::read_to_string(dest.join("game/logs/latest.log")).unwrap_or_default();
+            if log.contains("Backend library: LWJGL") {
+                break true;
+            }
+            if child.try_wait().unwrap().is_some() || start.elapsed() > Duration::from_secs(180) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        if !success {
+            panic!(
+                "{kind} switch failed to start: {}",
+                fs::read_to_string(dest.join("game/switch-process.log")).unwrap_or_default()
+            );
+        }
+        if source != root {
+            fs::remove_dir_all(&source).unwrap();
+        }
+        source = dest;
     }
 }
