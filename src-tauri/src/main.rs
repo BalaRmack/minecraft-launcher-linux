@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod java;
+mod modrinth;
 use mc_launcher_core::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,8 @@ struct Profile {
     version: String,
     loader: String,
     installed_id: Option<String>,
+    java: Option<String>,
+    memory_mb: Option<u32>,
 }
 #[derive(Serialize, Deserialize)]
 struct Settings {
@@ -54,8 +57,34 @@ fn root(app: &tauri::AppHandle) -> Result<PathBuf> {
 }
 fn db(app: &tauri::AppHandle) -> Result<Connection> {
     let c = Connection::open(root(app)?.join("horizon.sqlite3")).map_err(err)?;
-    c.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,version TEXT NOT NULL,loader TEXT NOT NULL,installed_id TEXT); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);").map_err(err)?;
+    c.busy_timeout(std::time::Duration::from_secs(3))
+        .map_err(err)?;
+    init_db(&c)?;
     Ok(c)
+}
+fn init_db(c: &Connection) -> Result<()> {
+    c.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,name TEXT NOT NULL); CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,version TEXT NOT NULL,loader TEXT NOT NULL,installed_id TEXT); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);").map_err(err)?;
+    for (column, declaration) in [("java", "TEXT"), ("memory_mb", "INTEGER")] {
+        let has_column = || -> Result<bool> {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('profiles') WHERE name=?1)",
+                [column],
+                |r| r.get(0),
+            )
+            .map_err(err)
+        };
+        if !has_column()? {
+            if let Err(e) = c.execute_batch(&format!(
+                "ALTER TABLE profiles ADD COLUMN {column} {declaration}"
+            )) {
+                // Another connection may have migrated the schema in the meantime.
+                if !has_column()? {
+                    return Err(err(e));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 fn get(c: &Connection, k: &str) -> Result<Option<String>> {
     c.query_row("SELECT value FROM settings WHERE key=?1", [k], |r| r.get(0))
@@ -68,7 +97,7 @@ fn set(c: &Connection, k: &str, v: &str) -> Result<()> {
 }
 fn profile(c: &Connection, id: &str) -> Result<Profile> {
     c.query_row(
-        "SELECT id,name,version,loader,installed_id FROM profiles WHERE id=?1",
+        "SELECT id,name,version,loader,installed_id,java,memory_mb FROM profiles WHERE id=?1",
         [id],
         |r| {
             Ok(Profile {
@@ -77,6 +106,8 @@ fn profile(c: &Connection, id: &str) -> Result<Profile> {
                 version: r.get(2)?,
                 loader: r.get(3)?,
                 installed_id: r.get(4)?,
+                java: r.get(5)?,
+                memory_mb: r.get(6)?,
             })
         },
     )
@@ -114,7 +145,7 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(err)?;
     let profiles = c
-        .prepare("SELECT id,name,version,loader,installed_id FROM profiles ORDER BY rowid")
+        .prepare("SELECT id,name,version,loader,installed_id,java,memory_mb FROM profiles ORDER BY rowid")
         .map_err(err)?
         .query_map([], |r| {
             Ok(Profile {
@@ -123,6 +154,8 @@ fn snapshot(app: tauri::AppHandle) -> Result<Snapshot> {
                 version: r.get(2)?,
                 loader: r.get(3)?,
                 installed_id: r.get(4)?,
+                java: r.get(5)?,
+                memory_mb: r.get(6)?,
             })
         })
         .map_err(err)?
@@ -280,8 +313,8 @@ async fn duplicate_profile(app: tauri::AppHandle, id: String, name: String) -> R
                 copy_instance(&src, &dest)?;
             }
             c.execute(
-                "INSERT INTO profiles(id,name,version,loader,installed_id) VALUES(?1,?2,?3,?4,?5)",
-                params![new_id, name, p.version, p.loader, p.installed_id],
+                "INSERT INTO profiles(id,name,version,loader,installed_id,java,memory_mb) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![new_id, name, p.version, p.loader, p.installed_id, p.java, p.memory_mb],
             )
             .map_err(err)?;
             Ok(())
@@ -293,6 +326,30 @@ async fn duplicate_profile(app: tauri::AppHandle, id: String, name: String) -> R
     })
     .await
     .map_err(err)?
+}
+#[tauri::command]
+fn save_profile_settings(
+    app: tauri::AppHandle,
+    id: String,
+    java: Option<String>,
+    memory_mb: Option<u32>,
+) -> Result<()> {
+    let _busy = acquire(&app, &id)?;
+    if memory_mb.is_some_and(|m| !(512..=65536).contains(&m))
+        || java
+            .as_ref()
+            .is_some_and(|j| j.trim().is_empty() || j.contains('\0'))
+    {
+        return Err("Укажите auto или путь к Java и память от 512 до 65536 МБ".into());
+    }
+    let c = db(&app)?;
+    profile(&c, &id)?;
+    c.execute(
+        "UPDATE profiles SET java=?1, memory_mb=?2 WHERE id=?3",
+        params![java.map(|j| j.trim().to_string()), memory_mb, id],
+    )
+    .map_err(err)?;
+    Ok(())
 }
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<()> {
@@ -373,7 +430,10 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             let _lock = state.0.lock().map_err(err)?;
             java::resolve(
                 &root(&app)?,
-                &get(&c, "java")?.unwrap_or_else(|| "auto".into()),
+                &p.java
+                    .clone()
+                    .or(get(&c, "java")?)
+                    .unwrap_or_else(|| "auto".into()),
                 major,
                 |s| {
                     let _ = app.emit("install-progress", s.to_string());
@@ -461,7 +521,10 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             let _lock = state.0.lock().map_err(err)?;
             java::resolve(
                 &root(&app)?,
-                &get(&c, "java")?.unwrap_or_else(|| "auto".into()),
+                &p.java
+                    .clone()
+                    .or(get(&c, "java")?)
+                    .unwrap_or_else(|| "auto".into()),
                 major,
                 |s| {
                     let _ = app.emit("install-progress", s.to_string());
@@ -483,8 +546,9 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
         let cmd = launcher
             .build_launch_command_from_version(&version, options)
             .map_err(err)?;
-        let mem = get(&c, "memory_mb")?
-            .and_then(|x| x.parse::<u32>().ok())
+        let mem = p
+            .memory_mb
+            .or(get(&c, "memory_mb")?.and_then(|x| x.parse::<u32>().ok()))
             .unwrap_or(2048);
         let log = fs::OpenOptions::new()
             .create(true)
@@ -627,8 +691,7 @@ async fn search_mods(query: String) -> Result<serde_json::Value> {
     .map_err(err)?
 }
 #[tauri::command]
-async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Result<()> {
-    let busy = acquire(&app, &id)?;
+async fn mod_details(project: String) -> Result<serde_json::Value> {
     if project.is_empty()
         || project.len() > 64
         || !project
@@ -637,7 +700,41 @@ async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Resu
     {
         return Err("Некорректный идентификатор проекта".into());
     }
-    tauri::async_runtime::spawn_blocking(move || { use std::io::Read; use sha2::{Digest,Sha512}; let _busy=busy; let c=db(&app)?; let p=profile(&c,&id)?; if p.installed_id.is_none() || p.loader=="vanilla" {return Err("Сначала установите сборку с загрузчиком модов".into());} let game_versions=serde_json::to_string(&vec![p.version]).map_err(err)?; let loaders=serde_json::to_string(&vec![p.loader]).map_err(err)?; let url=format!("https://api.modrinth.com/v2/project/{project}/version"); let versions:serde_json::Value=client()?.get(url).query(&[("game_versions",game_versions),("loaders",loaders)]).send().map_err(err)?.error_for_status().map_err(err)?.json().map_err(err)?; let v=versions.as_array().and_then(|a|a.first()).ok_or("Совместимая версия мода не найдена")?; if v["dependencies"].as_array().map_or(false, |a|a.iter().any(|d|d["dependency_type"]=="required")) {return Err("У мода есть обязательные зависимости: их автоматическая установка пока не поддерживается".into());} let files=v["files"].as_array().ok_or("Нет файлов мода")?; let file=files.iter().find(|f|f["primary"]==true).or_else(||files.first()).ok_or("Нет файлов мода")?; let name=file["filename"].as_str().ok_or("Нет имени файла")?; if !safe_mod_name(name) || !name.ends_with(".jar") {return Err("Недопустимое имя файла мода".into());} let url=file["url"].as_str().ok_or("Нет ссылки на файл")?; if !url.starts_with("https://cdn.modrinth.com/") {return Err("Недоверенный источник файла".into());} let hash=file["hashes"]["sha512"].as_str().ok_or("Нет SHA-512 файла")?; let mut resp=client()?.get(url).send().map_err(err)?.error_for_status().map_err(err)?; if resp.content_length().unwrap_or(0)>134_217_728 {return Err("Файл слишком большой".into());} let mut bytes=Vec::new(); resp.by_ref().take(134_217_729).read_to_end(&mut bytes).map_err(err)?; if bytes.len()>134_217_728 || format!("{:x}",Sha512::digest(&bytes))!=hash {return Err("Размер или контрольная сумма файла неверны".into());} let dir=mods_dir(&app,&id)?; let target=dir.join(name); if target.exists() {return Err("Мод с таким именем уже установлен".into());} let temp=dir.join(format!(".{}.tmp",Uuid::new_v4())); fs::write(&temp,bytes).map_err(err)?; if let Err(e)=fs::hard_link(&temp,&target) {let _=fs::remove_file(&temp);return Err(err(e));} fs::remove_file(temp).map_err(err)?; Ok(()) }).await.map_err(err)?
+    tauri::async_runtime::spawn_blocking(move || {
+        client()?
+            .get(format!("https://api.modrinth.com/v2/project/{project}"))
+            .send()
+            .map_err(err)?
+            .error_for_status()
+            .map_err(err)?
+            .json()
+            .map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
+async fn install_mod(app: tauri::AppHandle, id: String, project: String) -> Result<usize> {
+    let busy = acquire(&app, &id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _busy = busy;
+        let c = db(&app)?;
+        let p = profile(&c, &id)?;
+        if p.installed_id.is_none() || p.loader == "vanilla" {
+            return Err("Сначала установите сборку с загрузчиком модов".into());
+        }
+        modrinth::install(
+            &mods_dir(&app, &id)?,
+            &project,
+            &p.version,
+            &p.loader,
+            |s| {
+                let _ = app.emit("install-progress", s.to_string());
+            },
+        )
+    })
+    .await
+    .map_err(err)?
 }
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--version") {
@@ -655,6 +752,7 @@ fn main() {
             create_profile,
             delete_profile,
             duplicate_profile,
+            save_profile_settings,
             save_settings,
             versions,
             install_profile,
@@ -663,6 +761,7 @@ fn main() {
             list_mods,
             change_mod,
             search_mods,
+            mod_details,
             install_mod
         ])
         .run(tauri::generate_context!())
@@ -694,6 +793,18 @@ mod tests {
         assert!(!safe_mod_name(".example.jar"));
         assert!(!safe_mod_name("example.zip"));
     }
+    #[test]
+    fn migrates_old_profile_database_without_losing_data() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,version TEXT NOT NULL,loader TEXT NOT NULL,installed_id TEXT); INSERT INTO profiles VALUES ('a','world','1.20.1','fabric','installed');").unwrap();
+        init_db(&c).unwrap();
+        init_db(&c).unwrap();
+        let p = profile(&c, "a").unwrap();
+        assert_eq!(p.name, "world");
+        assert_eq!(p.installed_id.as_deref(), Some("installed"));
+        assert!(p.java.is_none() && p.memory_mb.is_none());
+    }
+
     #[test]
     fn instance_copy_is_independent() {
         let temp = tempfile::tempdir().unwrap();
@@ -798,6 +909,14 @@ mod tests {
         for (number, installed) in [vanilla, fabric].into_iter().enumerate() {
             let game = temp.path().join(format!("game-{number}"));
             fs::create_dir_all(&game).unwrap();
+            if number == 1 {
+                let count =
+                    modrinth::install(&game.join("mods"), "sodium", "1.20.1", "fabric", |s| {
+                        eprintln!("{s}")
+                    })
+                    .unwrap();
+                assert!(count > 0);
+            }
             let version = launcher.load_version(&installed.version_id).unwrap();
             let command = launcher
                 .build_launch_command_from_version(

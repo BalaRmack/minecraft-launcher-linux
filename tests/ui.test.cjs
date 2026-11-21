@@ -32,3 +32,11 @@ test('launch passes the selected profile, not a shell command', async () => {
 test('deletion requires confirmation', async () => {
  const {dom,calls}=setup(); await tick(); dom.window.confirm=()=>false; dom.window.document.querySelector('[data-action="delete-profile"]').click(); await tick(); assert.equal(calls.some(x=>x[0]==='delete_profile'),false); dom.window.close();
 });
+test('profile settings send overrides through native IPC', async () => {
+ const {dom,calls}=setup(); await tick(); const d=dom.window.document;
+ const dialog=d.querySelector('#profile-dialog'); dialog.showModal=()=>{}; dialog.close=()=>{};
+ d.querySelector('[data-action="settings-profile"]').click(); await tick();
+ const form=d.querySelector('#profile-settings-form'); form.elements.java.value='/usr/bin/java'; form.elements.memory_mb.value='4096';
+ form.dispatchEvent(new dom.window.SubmitEvent('submit',{bubbles:true,cancelable:true,submitter:form.querySelector('button[type=submit]')})); await tick();
+ const call=calls.find(x=>x[0]==='save_profile_settings'); assert.equal(call[1].id,'profile-id'); assert.equal(call[1].java,'/usr/bin/java'); assert.equal(call[1].memoryMb,4096); dom.window.close();
+});
