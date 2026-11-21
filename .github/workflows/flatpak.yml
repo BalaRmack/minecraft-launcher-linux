@@ -23,17 +23,20 @@ jobs:
         run: |
           flatpak install --user -y --noninteractive ./horizon.flatpak
           flatpak run io.github.balarmack.horizon --version
+          flatpak info --show-permissions io.github.balarmack.horizon
+          flatpak info --show-permissions io.github.balarmack.horizon | grep -q 'x11'
+          if flatpak info --show-permissions io.github.balarmack.horizon | grep -q 'fallback-x11'; then echo 'fallback-x11 hides XWayland in Wayland sessions'; exit 1; fi
           flatpak run --command=sh io.github.balarmack.horizon -c 'test -w "$HOME" && test -d /app && test -d /usr && mkdir -p "$XDG_DATA_HOME" && echo persisted > "$XDG_DATA_HOME/.horizon-ci-persistence"'
           flatpak run --command=sh io.github.balarmack.horizon -c 'test "$(cat "$XDG_DATA_HOME/.horizon-ci-persistence")" = persisted && rm "$XDG_DATA_HOME/.horizon-ci-persistence"'
       - name: Start the window in Flatpak under Xvfb
         run: |
           set +e
-          xvfb-run -a timeout 15s flatpak run --socket=x11 io.github.balarmack.horizon
+          xvfb-run -a timeout 15s flatpak run io.github.balarmack.horizon
           code=$?
           set -e
           if [ "$code" -ne 124 ]; then echo "Window exited unexpectedly: $code"; exit 1; fi
       - name: Install and launch game in Flatpak sandbox
-        run: .github/scripts/annotated.sh xvfb-run -a -s '-screen 0 1280x720x24' flatpak run --socket=x11 io.github.balarmack.horizon --smoke-test
+        run: .github/scripts/annotated.sh xvfb-run -a -s '-screen 0 1280x720x24' flatpak run io.github.balarmack.horizon --smoke-test
       - uses: actions/upload-artifact@v4
         with:
           name: horizon-flatpak-x86_64

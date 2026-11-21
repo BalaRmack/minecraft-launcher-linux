@@ -788,6 +788,62 @@ async fn install_profile(app: tauri::AppHandle, id: String) -> Result<()> {
     .await
     .map_err(err)?
 }
+// No credentials, session cookies, full environment or account details are written.
+fn graphics_diagnostics() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("\n[Horizon graphics diagnostics]\n");
+    for key in [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+        "GDK_BACKEND",
+        "LIBGL_ALWAYS_SOFTWARE",
+    ] {
+        let value = std::env::var(key).unwrap_or_else(|_| "<unset>".into());
+        let clean: String = value
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect();
+        let _ = writeln!(out, "{key}={clean}");
+    }
+    let _ = writeln!(
+        out,
+        "XAUTHORITY={} (contents not logged)",
+        if std::env::var_os("XAUTHORITY").is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "X11 socket directory present={}; DRI directory present={}",
+        std::path::Path::new("/tmp/.X11-unix").is_dir(),
+        std::path::Path::new("/dev/dri").is_dir()
+    );
+    if let Ok(info) = fs::read_to_string("/.flatpak-info") {
+        let mut context = false;
+        for line in info.lines() {
+            if line.starts_with('[') {
+                context = line == "[Context]";
+                continue;
+            }
+            if context
+                && (line.starts_with("shared=")
+                    || line.starts_with("sockets=")
+                    || line.starts_with("devices="))
+            {
+                let _ = writeln!(out, "Flatpak {line}");
+            }
+        }
+    } else {
+        let _ = writeln!(out, "Flatpak sandbox: no /.flatpak-info");
+    }
+    out.push_str("Java inherits the launcher's environment; no display variables are cleared.\n");
+    out
+}
 #[tauri::command]
 async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
     let busy = acquire(&app, &id)?;
@@ -847,11 +903,13 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
             .memory_mb
             .or(get(&c, "memory_mb")?.and_then(|x| x.parse::<u32>().ok()))
             .unwrap_or(2048);
-        let log = fs::OpenOptions::new()
+        let mut log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(game.join("horizon-game.log"))
             .map_err(err)?;
+        use std::io::Write as _;
+        log.write_all(graphics_diagnostics().as_bytes()).map_err(err)?;
         let log2 = log.try_clone().map_err(err)?;
         let mut child = Command::new(cmd.executable)
             .arg(format!("-Xmx{mem}M"))

@@ -9,7 +9,8 @@ finish-args:
   - --share=network
   - --share=ipc
   - --socket=wayland
-  - --socket=fallback-x11
+  # LWJGL 2 requires X11 even when the launcher uses native Wayland.
+  - --socket=x11
   - --socket=pulseaudio
   - --device=dri
   - --env=WEBKIT_DISABLE_DMABUF_RENDERER=1
