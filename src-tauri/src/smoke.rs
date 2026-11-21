@@ -1,5 +1,5 @@
 //! Opt-in live integration probe. Downloads real game files into a temporary directory.
-use crate::{catalog, copy_instance, integrity, java, loaders, modrinth, offline_uuid};
+use crate::{catalog, copy_instance, integrity, java, loaders, mod_state, modrinth, offline_uuid};
 use mc_launcher_core::prelude::*;
 use std::{
     collections::HashMap,
@@ -323,6 +323,116 @@ pub fn run() {
             );
         }
     }
+    // Exercise Xaero by its canonical Modrinth ID, including an actual old-to-new update.
+    let result = catalog::search(
+        &catalog::Cache::default(),
+        catalog::Search {
+            query: "Xaero's Minimap".into(),
+            version: "1.20.1".into(),
+            loader: "fabric".into(),
+            category: "".into(),
+            sort: "relevance".into(),
+            offset: 0,
+        },
+    )
+    .unwrap();
+    let xaero = result["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["slug"] == "xaeros-minimap")
+        .expect("Xaero search result")["project_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let versions: serde_json::Value = crate::client()
+        .unwrap()
+        .get(format!(
+            "https://api.modrinth.com/v2/project/{xaero}/version"
+        ))
+        .query(&[
+            ("game_versions", "[\"1.20.1\"]"),
+            ("loaders", "[\"fabric\"]"),
+        ])
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .unwrap();
+    let versions = versions.as_array().unwrap();
+    let newest = &versions[0];
+    let older = versions
+        .iter()
+        .find(|v| {
+            v["id"] != newest["id"]
+                && v["date_published"].as_str() < newest["date_published"].as_str()
+                && v["dependencies"]
+                    .as_array()
+                    .is_some_and(|d| d.iter().all(|x| x["dependency_type"] != "required"))
+        })
+        .expect("older Xaero release");
+    let xaero_dir = temp.path().join("xaero-profile/game/mods");
+    fs::create_dir_all(&xaero_dir).unwrap();
+    modrinth::install_exact_for_test(
+        &xaero_dir,
+        &xaero,
+        older["id"].as_str().unwrap(),
+        "1.20.1",
+        "fabric",
+    )
+    .unwrap();
+    let before = mod_state::status(&xaero_dir, "1.20.1", "fabric").unwrap();
+    let row = before["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["version"]["project_id"] == xaero)
+        .unwrap();
+    assert_eq!(row["version"]["id"], older["id"]);
+    assert_eq!(row["update"]["id"], newest["id"]);
+    let old_name = row["name"].as_str().unwrap().to_owned();
+    let old_bytes = fs::read(xaero_dir.join(&old_name)).unwrap();
+    assert_eq!(
+        modrinth::install(&xaero_dir, &xaero, "1.20.1", "fabric", |_| {}).unwrap(),
+        0
+    );
+    modrinth::update_with_cache(&xaero_dir, &xaero, "1.20.1", "fabric", None, |_| {}).unwrap();
+    let after = mod_state::status(&xaero_dir, "1.20.1", "fabric").unwrap();
+    let row = after["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["version"]["project_id"] == xaero)
+        .unwrap();
+    assert_eq!(row["version"]["id"], newest["id"]);
+    let backup_root = xaero_dir.parent().unwrap().join(".horizon-mod-backups");
+    let backup = fs::read_dir(backup_root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join(old_name);
+    assert_eq!(fs::read(backup).unwrap(), old_bytes);
+    let second = temp.path().join("xaero-second/game/mods");
+    fs::create_dir_all(&second).unwrap();
+    modrinth::install(&second, &xaero, "1.20.1", "fabric", |_| {}).unwrap();
+    fs::remove_file(xaero_dir.join(row["name"].as_str().unwrap())).unwrap();
+    let removed = mod_state::status(&xaero_dir, "1.20.1", "fabric").unwrap();
+    assert!(!removed["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["version"]["project_id"] == xaero));
+    assert!(
+        mod_state::status(&second, "1.20.1", "fabric").unwrap()["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["version"]["project_id"] == xaero)
+    );
+
     // Exercise real isolated copies and exact loader installs, without ever editing the source.
     let game = root.join("game");
     fs::create_dir_all(game.join("saves/world")).unwrap();

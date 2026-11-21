@@ -24,3 +24,4 @@ mc-launcher-core = { path = "vendor/mc-launcher-core" }
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
+zip = "2.4.2"

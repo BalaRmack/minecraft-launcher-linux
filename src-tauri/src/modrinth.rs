@@ -309,7 +309,9 @@ pub fn install_with_cache(
     cache: Option<&Path>,
     progress: impl Fn(&str),
 ) -> Result<usize> {
-    install_inner(dir, project, minecraft, loader, cache, false, progress)
+    install_inner(
+        dir, project, minecraft, loader, cache, false, None, progress,
+    )
 }
 pub fn update_with_cache(
     dir: &Path,
@@ -319,7 +321,26 @@ pub fn update_with_cache(
     cache: Option<&Path>,
     progress: impl Fn(&str),
 ) -> Result<usize> {
-    install_inner(dir, project, minecraft, loader, cache, true, progress)
+    install_inner(dir, project, minecraft, loader, cache, true, None, progress)
+}
+#[cfg(any(test, feature = "smoke-test"))]
+pub fn install_exact_for_test(
+    dir: &Path,
+    project: &str,
+    version: &str,
+    minecraft: &str,
+    loader: &str,
+) -> Result<usize> {
+    install_inner(
+        dir,
+        project,
+        minecraft,
+        loader,
+        None,
+        false,
+        Some(version),
+        |_| {},
+    )
 }
 fn install_inner(
     dir: &Path,
@@ -328,6 +349,7 @@ fn install_inner(
     loader: &str,
     cache: Option<&Path>,
     updating: bool,
+    root_version: Option<&str>,
     progress: impl Fn(&str),
 ) -> Result<usize> {
     let mut resolver = Resolver {
@@ -339,7 +361,7 @@ fn install_inner(
         files: Vec::new(),
         versions: Vec::new(),
     };
-    resolver.resolve(Some(project), None)?;
+    resolver.resolve(Some(project), root_version)?;
     fs::create_dir_all(dir).map_err(err)?;
     progress("Проверка известных конфликтов модов");
     let (local, complete) = crate::mod_state::scan(dir)?;
@@ -363,6 +385,9 @@ fn install_inner(
     }
     if !updating && !existing.is_empty() {
         return Ok(0);
+    }
+    if local.iter().any(|file| file.version.is_none()) {
+        return Err("Есть неопознанные файлы модов: нельзя исключить дубликаты или конфликты. Проверьте раздел Мои моды".into());
     }
     let old = if updating {
         let old = existing
@@ -391,6 +416,24 @@ fn install_inner(
         .filter_map(|f| f.version.clone())
         .collect();
     check_existing(&resolver.versions, &other_versions)?;
+    if old.is_some() {
+        for other in &other_versions {
+            if other["dependencies"].as_array().is_some_and(|deps| {
+                deps.iter().any(|dep| {
+                    dep["dependency_type"] == "required"
+                        && dep["project_id"] == target_id
+                        && dep["version_id"]
+                            .as_str()
+                            .is_some_and(|version| root["id"] != version)
+                })
+            }) {
+                return Err(
+                    "Другому установленному моду требуется прежняя версия; обновление остановлено"
+                        .into(),
+                );
+            }
+        }
+    }
     let mut records = crate::mod_state::ledger(dir)?;
     let stage = tempfile::tempdir_in(dir).map_err(err)?;
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
