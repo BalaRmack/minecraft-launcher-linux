@@ -421,7 +421,7 @@ pub fn install_with_cache(
             let _ = (|| -> std::io::Result<()> {
                 let temp = tempfile::NamedTempFile::new_in(dir)?;
                 fs::copy(source, temp.path())?;
-                temp.persist(path).map_err(|e| e.error)?;
+                temp.persist(&path).map_err(|e| e.error)?;
                 Ok(())
             })();
         }
