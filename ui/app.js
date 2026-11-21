@@ -61,7 +61,7 @@ function page(name) {
  if(name==='mods') { $('#mods-home-slot').append($('#mods-workspace')); updateProfileContext(); if(!catalogLoaded) { applyProfileFilters(false); loadCategories(); } loadCatalog(); if(modTab==='installed') loadMods(); }
 }
 $$('[data-page]').forEach(el=>el.addEventListener('click',()=>page(el.dataset.page))); $$('[data-go]').forEach(el=>el.addEventListener('click',()=>page(el.dataset.go)));
-async function refresh() { const previous=state.active_profile; state=await invoke('snapshot'); if(previous!==state.active_profile){modStatus=null;modStatusSequence++;} render(); checkProfiles(); }
+async function refresh() { const previous=state.active_profile; state=await invoke('snapshot'); if(previous!==state.active_profile){modStatus=null;modStatusSequence++;inspectSequence++;inspected=[];} render(); checkProfiles(); }
 function render() {
  const account=state.accounts.find(a=>a.id===state.active_account), p=activeProfile();
  $('#sidebar-account').textContent=account?.name || 'Не выбран'; $('#home-profile').textContent=p?.name || 'Выберите сборку'; $('#home-profile-detail').textContent=p ? `${p.version}  /  ${p.loader.toUpperCase()}` : 'Создайте свой игровой профиль, чтобы начать.'; $('#home-installed').textContent=p ? statusLabel(statusInfo(p.id)).toUpperCase() : 'НЕ УСТАНОВЛЕНО'; const homeState=p?statusInfo(p.id).state:'none'; $('#play').disabled=!!p&&['checking','installing'].includes(homeState); $('#play').innerHTML=homeState==='not_installed'?'↓ <span>Установить</span>':homeState==='broken'?'↻ <span>Восстановить</span>':homeState==='checking'?'◌ <span>Проверка</span>':homeState==='installing'?'◌ <span>Установка</span>':homeState==='error'?'↻ <span>Проверить</span>':'▶ <span>Играть</span>';
@@ -124,7 +124,7 @@ function modView(project) {
  const operation=modOperations.get(modKey(p.id,project)); if(operation?.running)return {state:'running',message:operation.message};
  if(!modStatus||modStatus.profile!==p.id)return {state:'checking'};
  const files=modStatus.files.filter(x=>x.version?.project_id===project);
- if(files.length){const first=files[0];if(operation?.error)return {state:'error',update:operation.update,name:first.name};if(files.length>1)return {state:'multiple',name:first.name};if(!first.enabled)return {state:'disabled',name:first.name};if(first.update)return {state:'update',name:first.name};return {state:'installed',name:first.name};}
+ if(files.length){const first=files[0];if(operation?.error)return {state:'error',update:operation.update,name:first.name};if(files.length>1)return {state:'multiple',name:first.name};if(!first.enabled)return {state:'disabled',name:first.name};if(first.update&&modStatus.lookup_complete&&!modStatus.unknown)return {state:'update',name:first.name};return {state:'installed',name:first.name};}
  if(operation?.error)return {state:'error',update:operation.update};
  if(!modStatus.lookup_complete||modStatus.unknown>0)return {state:'unknown'};
  return {state:'install'};
