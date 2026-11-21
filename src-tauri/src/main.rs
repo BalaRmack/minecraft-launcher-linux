@@ -605,13 +605,11 @@ async fn launch_profile(app: tauri::AppHandle, id: String) -> Result<()> {
         let a = app.clone();
         std::thread::spawn(move || {
             let status = child.wait();
-            let _ = a.emit(
-                "game-exit",
-                match status {
-                    Ok(s) => format!("Игра завершена: {s}"),
-                    Err(e) => format!("Ошибка игры: {e}"),
-                },
-            );
+            let event = match status {
+                Ok(s) => serde_json::json!({"profile_id": id, "success": s.success(), "status": s.to_string()}),
+                Err(e) => serde_json::json!({"profile_id": id, "success": false, "status": e.to_string()}),
+            };
+            let _ = a.emit("game-exit", event);
             drop(busy);
         });
         Ok(())

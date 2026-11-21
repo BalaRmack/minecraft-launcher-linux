@@ -33,6 +33,7 @@ fn str_field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
 }
 struct Resolver<'a> {
     client: Client,
+    api: String,
     minecraft: &'a str,
     loader: &'a str,
     seen: HashMap<String, String>,
@@ -45,7 +46,7 @@ impl Resolver<'_> {
         }
         let value = if let Some(id) = id {
             self.client
-                .get(format!("https://api.modrinth.com/v2/version/{id}"))
+                .get(format!("{}/version/{id}", self.api))
                 .send()
                 .map_err(err)?
                 .error_for_status()
@@ -56,9 +57,7 @@ impl Resolver<'_> {
             let project = project.ok_or("У зависимости нет идентификатора проекта")?;
             let versions: Value = self
                 .client
-                .get(format!(
-                    "https://api.modrinth.com/v2/project/{project}/version"
-                ))
+                .get(format!("{}/project/{project}/version", self.api))
                 .query(&[
                     (
                         "game_versions",
@@ -172,6 +171,7 @@ pub fn install(
 ) -> Result<usize> {
     let mut resolver = Resolver {
         client: client()?,
+        api: "https://api.modrinth.com/v2".into(),
         minecraft,
         loader,
         seen: HashMap::new(),
@@ -262,5 +262,47 @@ mod tests {
         let v = serde_json::json!({"filename":"../evil.jar","url":"https://cdn.modrinth.com/x","hashes":{"sha512":"a".repeat(128)}});
         assert!(metadata(&v).is_err());
         assert!(!valid_id("../evil"));
+    }
+    #[test]
+    fn resolves_required_dependencies_and_cycles() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let root = serde_json::json!({"id":"vroot","project_id":"root","game_versions":["1.20.1"],"loaders":["fabric"],"dependencies":[{"dependency_type":"required","project_id":"dep","version_id":"vdep"}],"files":[{"filename":"root.jar"}]});
+        let dep = serde_json::json!({"id":"vdep","project_id":"dep","game_versions":["1.20.1"],"loaders":["fabric"],"dependencies":[{"dependency_type":"required","project_id":"root","version_id":"vroot"}],"files":[{"filename":"dep.jar"}]});
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.starts_with("GET /project/root/version?") {
+                    serde_json::json!([root.clone()]).to_string()
+                } else if req.starts_with("GET /version/vdep ") {
+                    dep.to_string()
+                } else if req.starts_with("GET /version/vroot ") {
+                    root.to_string()
+                } else {
+                    panic!("unexpected request {req}")
+                };
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let mut resolver = Resolver {
+            client: Client::builder().no_proxy().build().unwrap(),
+            api: format!("http://{addr}"),
+            minecraft: "1.20.1",
+            loader: "fabric",
+            seen: HashMap::new(),
+            files: Vec::new(),
+        };
+        resolver.resolve(Some("root"), None).unwrap();
+        assert_eq!(resolver.seen.len(), 2);
+        assert_eq!(resolver.files.len(), 2);
+        assert_eq!(resolver.files[0]["filename"], "dep.jar");
+        worker.join().unwrap();
     }
 }

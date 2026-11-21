@@ -8,9 +8,8 @@ mkdir -p .flatpak-source/src-tauri .flatpak-source/packaging/flatpak
 cp -a ui .flatpak-source/
 cp -a src-tauri/Cargo.toml src-tauri/build.rs src-tauri/tauri.conf.json src-tauri/src src-tauri/vendor src-tauri/icons src-tauri/capabilities .flatpak-source/src-tauri/
 cp -a packaging/flatpak/*.desktop packaging/flatpak/*.xml .flatpak-source/packaging/flatpak/
-# Generate a lockfile if this checkout predates one. Production builds should
-# commit Cargo.lock to guarantee that the inputs are reproducible.
-if [[ ! -f src-tauri/Cargo.lock ]]; then cargo generate-lockfile --manifest-path src-tauri/Cargo.toml; fi
+# The committed lockfile makes the dependency resolution reproducible.
+test -f src-tauri/Cargo.lock
 cp src-tauri/Cargo.lock .flatpak-source/src-tauri/
 cargo vendor --locked --manifest-path src-tauri/Cargo.toml .flatpak-source/cargo-vendor >/dev/null
 mkdir -p .flatpak-source/src-tauri/.cargo

@@ -6,13 +6,13 @@ const html = fs.readFileSync('ui/index.html', 'utf8');
 const script = fs.readFileSync('ui/app.js', 'utf8');
 const tick = () => new Promise(resolve => setTimeout(resolve, 20));
 function setup() {
-  const calls = [];
+  const calls = [], listeners = {};
   const snapshot = { accounts: [{id:'account-id',name:'Steve'}], profiles: [{id:'profile-id',name:'<img src=x onerror=alert(1)>',version:'1.21.4',loader:'fabric',installed_id:'fabric-1.21.4'}], active_account:'account-id',active_profile:'profile-id',settings:{java:'java',memory_mb:2048} };
   const dom = new JSDOM(html, {runScripts:'outside-only',url:'https://horizon.local'});
   dom.window.confirm = () => true;
-  dom.window.__TAURI__ = {core:{invoke:async (name,args) => {calls.push([name,args]); if(name==='snapshot')return snapshot; if(name==='versions')return [{id:'1.21.4',type:'release'},{id:'25w01a',type:'snapshot'},{id:'old',type:'old_beta'}]; if(name==='list_mods')return []; return null;}},event:{listen:async()=>{}}};
+  dom.window.__TAURI__ = {core:{invoke:async (name,args) => {calls.push([name,args]); if(name==='snapshot')return snapshot; if(name==='versions')return [{id:'1.21.4',type:'release'},{id:'25w01a',type:'snapshot'},{id:'old',type:'old_beta'}]; if(name==='list_mods')return []; return null;}},event:{listen:async (name, callback)=>{listeners[name]=callback;}}};
   dom.window.eval(script);
-  return {dom,calls,snapshot};
+  return {dom,calls,snapshot,listeners};
 }
 test('renders state safely and filters Mojang versions', async () => {
  const {dom} = setup(); await tick(); const d=dom.window.document;
@@ -39,4 +39,9 @@ test('profile settings send overrides through native IPC', async () => {
  const form=d.querySelector('#profile-settings-form'); form.elements.java.value='/usr/bin/java'; form.elements.memory_mb.value='4096';
  form.dispatchEvent(new dom.window.SubmitEvent('submit',{bubbles:true,cancelable:true,submitter:form.querySelector('button[type=submit]')})); await tick();
  const call=calls.find(x=>x[0]==='save_profile_settings'); assert.equal(call[1].id,'profile-id'); assert.equal(call[1].java,'/usr/bin/java'); assert.equal(call[1].memoryMb,4096); dom.window.close();
+});
+
+test('game process failures are surfaced as errors', async () => {
+ const {dom,listeners}=setup(); await tick(); listeners['game-exit']({payload:{success:false,status:'exit status: 1'}});
+ assert.match(dom.window.document.querySelector('#status').textContent,/Ошибка игры/); dom.window.close();
 });

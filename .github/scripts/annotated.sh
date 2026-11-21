@@ -11,7 +11,7 @@ if (( status != 0 )); then
   python3 - "$log" <<'PY'
 import sys
 with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
-    text = f.read()[-12000:]
+    text = f.read()[-3500:]
 text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
 print(f'::error title=Build or test failed::{text}')
 PY

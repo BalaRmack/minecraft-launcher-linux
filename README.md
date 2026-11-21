@@ -29,7 +29,7 @@ flatpak run io.github.balarmack.horizon
 
 При первой установке потребуется загрузить GNOME runtime с Flathub; файлы игры и Java загружаются при установке сборки. RPM-пакеты хоста не нужны. До успешной сборки и испытания на Bazzite нельзя считать этот пакет готовым к ежедневной эксплуатации.
 
-Для разработчиков: `packaging/flatpak/build.sh` требует `cargo`, `flatpak`, `flatpak-builder`, настроенный пользовательский remote `flathub` и сетевой доступ при подготовке Cargo vendor. Он генерирует временный исходный каталог `.flatpak-source`, собирает его в sandbox и создаёт `horizon.flatpak`. Без закоммиченного `Cargo.lock` зависимости разрешаются заново, поэтому сборка пока не полностью воспроизводима.
+Для разработчиков: `packaging/flatpak/build.sh` требует `cargo`, `flatpak`, `flatpak-builder`, настроенный пользовательский remote `flathub` и сетевой доступ при подготовке Cargo vendor. Он генерирует временный исходный каталог `.flatpak-source`, собирает его в sandbox и создаёт `horizon.flatpak`. Зависимости Rust зафиксированы в `src-tauri/Cargo.lock`; SDK и CI-окружение всё ещё необходимо контролировать отдельно для побитовой воспроизводимости.
 
 ## Сборка для разработки на Debian/Ubuntu x86_64
 
@@ -48,6 +48,8 @@ npx --yes @tauri-apps/cli@2 build --bundles deb
 ```sh
 xvfb-run -a -s '-screen 0 1280x720x24' cargo test --manifest-path src-tauri/Cargo.toml live_minecraft_vanilla_and_fabric -- --ignored --nocapture
 ```
+
+На коммите `81bdb1d` [нативный CI](https://github.com/BalaRmack/minecraft-launcher-linux/actions/runs/44889990103) успешно прошёл этот тест с принудительной загрузкой Java, Vanilla, Fabric, Sodium и повторным использованием файлов. Он проверяет достижение инициализации LWJGL, но не ручную игру. [Сборка Flatpak коммита `81bdb1d`](https://github.com/BalaRmack/minecraft-launcher-linux/actions/runs/44889990074) также прошла установку, запуск окна и тот же тест игры внутри sandbox под Xvfb; артефакт `horizon-flatpak-x86_64` доступен в этом запуске, но старее текущего кода. Это не проверка на Bazzite или на реальном GPU.
 
 Тест загружает сотни мегабайт и требует доступ к Mojang, Adoptium и Fabric. Текущий тест дополнительно устанавливает Sodium из Modrinth перед запуском Fabric; он не проверяет все зависимости модов, Microsoft OAuth или Bazzite sandbox. Отдельные unit-тесты не подменяют реальную сетевую интеграцию. Состояние проверок — в GitHub Actions для конкретного коммита.
 

@@ -285,11 +285,24 @@ fn download_installer(
         .join("versions")
         .join(".installers")
         .join(format!("{loader_name}-{loader_version}-installer.jar"));
+    // Forge and NeoForge publish Maven SHA-1 sidecars. Refuse to run an
+    // installer if its integrity metadata cannot be obtained and validated.
+    let checksum_text = crate::net::http::get_text(&format!("{url}.sha1"))?;
+    let checksum = checksum_text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if checksum.len() != 40 || !checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(LauncherError::Other {
+            message: format!("invalid {loader_name} installer checksum"),
+        });
+    }
     let plan = DownloadPlan {
         tasks: vec![DownloadTask {
             url: url.to_string(),
             destination: destination.clone(),
-            checksum: None,
+            checksum: Some(crate::net::download::Checksum::Sha1(checksum)),
             label: format!("{loader_name} installer {loader_version}"),
         }],
     };

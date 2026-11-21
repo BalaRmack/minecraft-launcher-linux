@@ -23,7 +23,8 @@ jobs:
         run: |
           flatpak install --user -y --noninteractive ./horizon.flatpak
           flatpak run io.github.balarmack.horizon --version
-          flatpak run --command=sh io.github.balarmack.horizon -c 'test -w "$HOME" && test -d /app && test -d /usr'
+          flatpak run --command=sh io.github.balarmack.horizon -c 'test -w "$HOME" && test -d /app && test -d /usr && mkdir -p "$XDG_DATA_HOME" && echo persisted > "$XDG_DATA_HOME/.horizon-ci-persistence"'
+          flatpak run --command=sh io.github.balarmack.horizon -c 'test "$(cat "$XDG_DATA_HOME/.horizon-ci-persistence")" = persisted && rm "$XDG_DATA_HOME/.horizon-ci-persistence"'
       - name: Start the window in Flatpak under Xvfb
         run: |
           set +e
