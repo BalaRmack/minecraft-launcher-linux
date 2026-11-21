@@ -38,6 +38,7 @@ struct Resolver<'a> {
     loader: &'a str,
     seen: HashMap<String, String>,
     files: Vec<Value>,
+    versions: Vec<Value>,
 }
 impl Resolver<'_> {
     fn version(&self, project: Option<&str>, id: Option<&str>) -> Result<Value> {
@@ -120,6 +121,7 @@ impl Resolver<'_> {
                 self.resolve(p, v)?;
             }
         }
+        self.versions.push(version.clone());
         let files = version["files"].as_array().ok_or("Нет файлов мода")?;
         self.files.push(
             files
@@ -161,6 +163,68 @@ fn metadata(file: &Value) -> Result<(&str, &str, &str)> {
     }
     Ok((name, url, hash))
 }
+fn incompatible_with(a: &Value, b: &Value) -> bool {
+    a["dependencies"].as_array().is_some_and(|deps| {
+        deps.iter().any(|d| {
+            if d["dependency_type"] != "incompatible" {
+                return false;
+            }
+            let project = d["project_id"].as_str();
+            let version = d["version_id"].as_str();
+            (project.is_some() || version.is_some())
+                && project.map_or(true, |p| b["project_id"] == p)
+                && version.map_or(true, |v| b["id"] == v)
+        })
+    })
+}
+fn check_existing(planned: &[Value], existing: &[Value]) -> Result<()> {
+    for v in planned {
+        for other in existing.iter().chain(planned.iter()) {
+            if v["project_id"] == other["project_id"] && v["id"] != other["id"] {
+                return Err(format!("Другая версия мода {} уже установлена или требуется зависимостью; удалите конфликтующий файл вручную", v["project_id"].as_str().unwrap_or("?")));
+            }
+            if incompatible_with(v, other) || incompatible_with(other, v) {
+                return Err(format!(
+                    "Modrinth сообщает о несовместимости модов {} и {}",
+                    v["project_id"].as_str().unwrap_or("?"),
+                    other["project_id"].as_str().unwrap_or("?")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+fn recognized_existing(resolver: &Resolver<'_>, dir: &Path) -> Result<Vec<Value>> {
+    let mut hashes = Vec::new();
+    for entry in fs::read_dir(dir).map_err(err)? {
+        let entry = entry.map_err(err)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry.file_type().map_err(err)?.is_file()
+            && name.ends_with(".jar")
+            && safe_mod_name(&name)
+        {
+            hashes.push(hash_file(&entry.path())?);
+        }
+    }
+    let mut out = Vec::new();
+    for chunk in hashes.chunks(100) {
+        let data: Value = resolver
+            .client
+            .post(format!("{}/version_files", resolver.api))
+            .json(&serde_json::json!({"hashes":chunk, "algorithm":"sha512"}))
+            .send()
+            .map_err(err)?
+            .error_for_status()
+            .map_err(err)?
+            .json()
+            .map_err(err)?;
+        let map = data
+            .as_object()
+            .ok_or("Некорректный ответ Modrinth при проверке установленных модов")?;
+        out.extend(map.values().cloned());
+    }
+    Ok(out)
+}
 /// Downloads all required files before promoting any of them. Never overwrites existing mods.
 pub fn install(
     dir: &Path,
@@ -176,9 +240,12 @@ pub fn install(
         loader,
         seen: HashMap::new(),
         files: Vec::new(),
+        versions: Vec::new(),
     };
     resolver.resolve(Some(project), None)?;
     fs::create_dir_all(dir).map_err(err)?;
+    progress("Проверка известных конфликтов модов");
+    check_existing(&resolver.versions, &recognized_existing(&resolver, dir)?)?;
     let stage = tempfile::tempdir_in(dir).map_err(err)?;
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut names = HashMap::new();
@@ -264,6 +331,15 @@ mod tests {
         assert!(!valid_id("../evil"));
     }
     #[test]
+    fn detects_existing_versions_and_declared_conflicts() {
+        let planned = serde_json::json!({"project_id":"root","id":"new", "dependencies":[{"dependency_type":"incompatible","project_id":"other"}]});
+        let old = serde_json::json!({"project_id":"root","id":"old"});
+        let other = serde_json::json!({"project_id":"other","id":"v"});
+        assert!(check_existing(&[planned.clone()], &[old]).is_err());
+        assert!(check_existing(&[planned.clone()], &[other]).is_err());
+        assert!(check_existing(&[planned.clone()], &[planned]).is_ok());
+    }
+    #[test]
     fn resolves_required_dependencies_and_cycles() {
         use std::{
             io::{Read, Write},
@@ -298,6 +374,7 @@ mod tests {
             loader: "fabric",
             seen: HashMap::new(),
             files: Vec::new(),
+            versions: Vec::new(),
         };
         resolver.resolve(Some("root"), None).unwrap();
         assert_eq!(resolver.seen.len(), 2);
