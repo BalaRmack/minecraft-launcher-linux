@@ -833,6 +833,9 @@ fn graphics_diagnostics() -> String {
             .collect();
         let _ = writeln!(out, "{key}={clean}");
     }
+    let has_xrandr = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|p| p.join("xrandr").is_file()));
+    let _ = writeln!(out, "xrandr available in PATH={has_xrandr}");
     let _ = writeln!(
         out,
         "XAUTHORITY={} (contents not logged)",

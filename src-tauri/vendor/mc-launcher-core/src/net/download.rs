@@ -2,6 +2,10 @@
 
 use std::{fs, io::Write, path::PathBuf};
 
+// The semaphore is shared across all profiles and Tokio runtimes in this process.
+static DOWNLOAD_LIMIT: once_cell::sync::Lazy<tokio::sync::Semaphore> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(8));
+
 use crate::{
     io::hash::sha1_file,
     progress::{ProgressEvent, ProgressReporter, SkipReason},
@@ -226,6 +230,12 @@ async fn download_one(
             return Ok(());
         }
     }
+    let _permit = DOWNLOAD_LIMIT
+        .acquire()
+        .await
+        .map_err(|e| LauncherError::Other {
+            message: e.to_string(),
+        })?;
     let _ = tx.send(ProgressEvent::TaskStarted {
         label: task.label.clone(),
         path: task.destination.clone(),

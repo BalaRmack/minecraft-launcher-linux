@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+static MOD_DOWNLOAD_LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
 const MAX_FILE: u64 = 128 * 1024 * 1024;
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -232,6 +233,11 @@ struct ModDownload {
     temp: PathBuf,
 }
 async fn download_mod(client: reqwest::Client, item: ModDownload) -> Result<()> {
+    let _permit = MOD_DOWNLOAD_LIMIT
+        .get_or_init(|| tokio::sync::Semaphore::new(4))
+        .acquire()
+        .await
+        .map_err(err)?;
     let mut last = String::new();
     for attempt in 0..3 {
         let result: Result<()> = async {

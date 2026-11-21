@@ -30,7 +30,7 @@ impl Metrics {
     fn print(&self, name: &str) {
         let secs = self.started.elapsed().as_secs_f64();
         eprintln!(
-            "BENCHMARK {name}: {:.2}s downloaded={} reused={} network_bytes={} avg_MB_s={:.2}",
+            "::notice title=Horizon benchmark::{name}: {:.2}s downloaded={} reused={} network_bytes={} avg_MB_s={:.2}",
             secs,
             self.downloads,
             self.reused,
@@ -156,16 +156,17 @@ pub fn run() {
         .install_with_progress_and_java(InstallRequest::vanilla("1.20.1"), &mut modern_first, &java)
         .unwrap();
     modern_first.print("vanilla-1.20.1-first");
-    let mut skipped = 0usize;
+    let mut modern_repeat = Metrics::new(cache.clone());
     launcher
-        .install_with_progress(InstallRequest::vanilla("1.20.1"), &mut |event| {
-            if matches!(event, ProgressEvent::TaskSkipped { .. }) {
-                skipped += 1;
-            }
-        })
+        .install_with_progress_and_java(
+            InstallRequest::vanilla("1.20.1"),
+            &mut modern_repeat,
+            &java,
+        )
         .unwrap();
+    modern_repeat.print("vanilla-1.20.1-repeat");
     assert!(
-        skipped > 100,
+        modern_repeat.reused > 100,
         "verified libraries and assets should be reused"
     );
     let mut fabric_metrics = Metrics::new(cache.clone());

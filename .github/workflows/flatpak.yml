@@ -23,6 +23,7 @@ jobs:
         run: |
           flatpak install --user -y --noninteractive ./horizon.flatpak
           flatpak run io.github.balarmack.horizon --version
+          flatpak run --command=sh io.github.balarmack.horizon -c 'command -v xrandr'
           flatpak info --show-permissions io.github.balarmack.horizon
           flatpak info --show-permissions io.github.balarmack.horizon | grep -q 'x11'
           if flatpak info --show-permissions io.github.balarmack.horizon | grep -q 'fallback-x11'; then echo 'fallback-x11 hides XWayland in Wayland sessions'; exit 1; fi

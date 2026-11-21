@@ -45,7 +45,7 @@ jobs:
       - name: Install Linux and virtual display dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev liblzma-dev xvfb xauth libgl1-mesa-dri
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev liblzma-dev xvfb xauth libgl1-mesa-dri x11-xserver-utils
       - uses: dtolnay/rust-toolchain@stable
       - name: Install and launch Vanilla and Fabric under Xvfb
         run: .github/scripts/annotated.sh xvfb-run -a -s '-screen 0 1280x720x24' cargo test --locked --manifest-path src-tauri/Cargo.toml live_minecraft_vanilla_and_fabric -- --ignored --nocapture

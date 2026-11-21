@@ -20,6 +20,12 @@ build-options:
     CARGO_HOME: /run/build/horizon/cargo-home
     CARGO_NET_OFFLINE: 'true'
 modules:
+  # LWJGL 2 invokes xrandr to enumerate display modes (Minecraft <= 1.12).
+  - name: xrandr
+    sources:
+      - type: archive
+        url: https://www.x.org/archive/individual/app/xrandr-1.5.4.tar.gz
+        sha256: b022276f1f2e6e206803027a5f569e6eb51e69d2d8886bfb5a7bc0612ddca4ee
   - name: horizon
     buildsystem: simple
     build-commands:
