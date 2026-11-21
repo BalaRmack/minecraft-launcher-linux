@@ -1,0 +1,32 @@
+id: io.github.balarmack.horizon
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: horizon
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  - --env=WEBKIT_DISABLE_DMABUF_RENDERER=1
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/horizon/cargo-home
+    CARGO_NET_OFFLINE: 'true'
+modules:
+  - name: horizon
+    buildsystem: simple
+    build-commands:
+      - cargo build --manifest-path src-tauri/Cargo.toml --release --offline --features custom-protocol
+      - install -Dm755 src-tauri/target/release/horizon /app/bin/horizon
+      - install -Dm644 packaging/flatpak/io.github.balarmack.horizon.desktop /app/share/applications/io.github.balarmack.horizon.desktop
+      - install -Dm644 packaging/flatpak/io.github.balarmack.horizon.metainfo.xml /app/share/metainfo/io.github.balarmack.horizon.metainfo.xml
+      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/256x256/apps/io.github.balarmack.horizon.png
+    sources:
+      - type: dir
+        path: ../../.flatpak-source

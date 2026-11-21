@@ -20,6 +20,11 @@ jobs:
           workspaces: src-tauri -> target
       - name: Test Rust core
         run: cargo test --manifest-path src-tauri/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: src-tauri/Cargo.lock
+          if-no-files-found: error
       - name: Test frontend
         run: |
           npm ci
@@ -32,3 +37,15 @@ jobs:
           name: horizon-linux-deb
           path: src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
+  game-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux and virtual display dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libxdo-dev libssl-dev librsvg2-dev liblzma-dev xvfb xauth libgl1-mesa-dri
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install and launch Vanilla and Fabric under Xvfb
+        run: xvfb-run -a -s '-screen 0 1280x720x24' cargo test --manifest-path src-tauri/Cargo.toml live_minecraft_vanilla_and_fabric -- --ignored --nocapture

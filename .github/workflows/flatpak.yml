@@ -1,0 +1,31 @@
+name: Flatpak Linux
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  flatpak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Flatpak builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+      - name: Build offline in GNOME SDK sandbox
+        run: packaging/flatpak/build.sh
+      - name: Install and smoke-test the sandbox
+        run: |
+          flatpak install --user -y --noninteractive ./horizon.flatpak
+          flatpak run io.github.balarmack.horizon --version
+          flatpak run --command=sh io.github.balarmack.horizon -c 'test -w "$HOME" && test -d /app && test -d /usr'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: horizon-flatpak-x86_64
+          path: horizon.flatpak
+          if-no-files-found: error

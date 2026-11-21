@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Horizon
+Comment=Minecraft launcher
+Exec=horizon
+Icon=io.github.balarmack.horizon
+Terminal=false
+Type=Application
+Categories=Game;

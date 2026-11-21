@@ -3,3 +3,8 @@
 /dist/
 *.AppImage
 *.flatpak
+
+/.flatpak-source/
+/.flatpak-builder/
+/flatpak-repo/
+/flatpak-build/
