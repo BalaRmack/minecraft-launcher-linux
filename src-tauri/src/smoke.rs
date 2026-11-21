@@ -65,7 +65,19 @@ impl ProgressReporter for Metrics {
 
 pub fn run() {
     use std::time::{Duration, Instant};
-    let temp = tempfile::tempdir().unwrap();
+    // Flatpak's /tmp can be a small tmpfs: several isolated installations plus
+    // the shared cache exceed it. Use the sandbox's writable disk-backed cache.
+    let temp = if std::path::Path::new("/.flatpak-info").exists() {
+        let cache =
+            PathBuf::from(std::env::var_os("XDG_CACHE_HOME").expect("Flatpak XDG_CACHE_HOME"));
+        fs::create_dir_all(&cache).unwrap();
+        tempfile::Builder::new()
+            .prefix("horizon-smoke-")
+            .tempdir_in(cache)
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
     // Make the live test exercise the managed runtime even on a runner
     // that already has Java 17 installed. This test runs alone.
     let old_path = std::env::var_os("PATH");
