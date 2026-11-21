@@ -7,7 +7,7 @@
   function chunksOnMain(text) {
     const tokens=marked.lexer(text,{gfm:true,breaks:true}),chunks=[];let group=[],size=0;
     const flush=()=>{if(!group.length)return;group.links=tokens.links;chunks.push(marked.parser(group,{gfm:true,breaks:true}));group=[];size=0;};
-    for(const token of tokens){if(size>6000)flush();group.push(token);size+=(token.raw||'').length;}flush();return chunks;
+    for(const token of tokens){if(size>600)flush();group.push(token);size+=(token.raw||'').length;}flush();return chunks;
   }
   function parse(text) {
     if(cache.has(text)){const value=cache.get(text);cache.delete(text);cache.set(text,value);return Promise.resolve(value);}
@@ -47,7 +47,7 @@
     const truncated=text.length>MAX_SOURCE; const source=text.slice(0,MAX_SOURCE);
     const chunks=await parse(source);if(container._renderToken!==token)return;
     let i=0;
-    await new Promise(resolve=>{function step(){if(container._renderToken!==token){resolve();return;}const start=performance.now();let count=0;while(i<chunks.length&&count<4&&performance.now()-start<8){const section=document.createElement('section');section.className='description-chunk';section.append(sanitize(chunks[i++],options.base||'https://modrinth.com/',observer));container.append(section);count++;}if(i<chunks.length)(window.requestAnimationFrame||setTimeout)(step);else resolve();}step();});
+    await new Promise(resolve=>{function step(){if(container._renderToken!==token){resolve();return;}const start=performance.now();let count=0;while(i<chunks.length&&count<1&&performance.now()-start<8){const section=document.createElement('section');section.className='description-chunk';section.append(sanitize(chunks[i++],options.base||'https://modrinth.com/',observer));container.append(section);count++;}if(i<chunks.length)(window.requestAnimationFrame||setTimeout)(step);else resolve();}step();});
     if(truncated&&container._renderToken===token){const note=document.createElement('p');note.className='embed-note';note.textContent='Описание слишком длинное; показана только первая часть.';container.append(note);}
   }
   function clear(container){container._renderToken=Symbol();if(container._imageObserver)container._imageObserver.disconnect();container.replaceChildren();}
