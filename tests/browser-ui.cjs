@@ -31,7 +31,7 @@ const assert = require('node:assert/strict');
  });
  assert.equal(scrollResult.headBefore,scrollResult.headAfter);assert.equal(scrollResult.nodesBefore,scrollResult.nodesAfter);
  await page.keyboard.press('Escape');await page.locator('#mod-dialog').waitFor({state:'hidden'});assert.equal(await page.locator('.content').evaluate(e=>e.scrollTop),before);
- await page.locator('[data-action=view-mod]').first().click();await page.locator('#mod-body h2').first().waitFor();await page.locator('#close-dialog').click();await page.locator('#mod-dialog').waitFor({state:'hidden'});
+ await page.emulateMedia({reducedMotion:'no-preference'});await page.locator('[data-action=view-mod]').first().click();assert(await page.locator('#mod-dialog').evaluate(e=>e.getAnimations().length)>0,'modal should use a shared transform animation');await page.locator('#mod-body h2').first().waitFor();await page.locator('#close-dialog').click();assert(await page.locator('#mod-dialog').evaluate(e=>e.getAnimations().length)>0,'modal close should animate back');await page.locator('#mod-dialog').waitFor({state:'hidden'});
  await page.locator('[data-page=home]').click();await page.locator('[data-page=profiles]').click();await page.locator('[data-action=open-instance]').first().click();await page.locator('#instance.active').waitFor();
  assert.deepEqual(errors,[]);
  console.log('::notice title=Horizon browser performance::'+JSON.stringify({renderMs,images:220,initialImageRequests:initialRequests,requestsAfterScroll:requests,scroll:scrollResult,longTasks:await page.evaluate(start=>window.perfLong.filter(e=>e.start>=start),perfStart)}));

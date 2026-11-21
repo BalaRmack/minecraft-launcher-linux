@@ -36,6 +36,8 @@ jobs:
           code=$?
           set -e
           if [ "$code" -ne 124 ]; then echo "Window exited unexpectedly: $code"; exit 1; fi
+      - name: Test descriptions in the installed Flatpak WebKit view
+        run: .github/scripts/annotated.sh xvfb-run -a -s '-screen 0 1280x720x24' timeout 120s flatpak run io.github.balarmack.horizon --ui-smoke-test
       - name: Install and launch game in Flatpak sandbox
         run: .github/scripts/annotated.sh xvfb-run -a -s '-screen 0 1280x720x24' flatpak run io.github.balarmack.horizon --smoke-test
       - uses: actions/upload-artifact@v4

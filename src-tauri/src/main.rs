@@ -1363,6 +1363,21 @@ async fn install_mod(
     .await
     .map_err(err)?
 }
+#[tauri::command]
+fn ui_smoke_result(app: tauri::AppHandle, success: bool, details: String) -> Result<()> {
+    if !cfg!(feature = "smoke-test")
+        || std::env::args().nth(1).as_deref() != Some("--ui-smoke-test")
+    {
+        return Err("Команда доступна только в тестовом режиме".into());
+    }
+    println!(
+        "::{} title=Horizon Flatpak WebKit UI::{}",
+        if success { "notice" } else { "error" },
+        details.replace('\n', " ")
+    );
+    app.exit(if success { 0 } else { 1 });
+    Ok(())
+}
 fn main() {
     #[cfg(feature = "smoke-test")]
     if std::env::args().nth(1).as_deref() == Some("--smoke-test") {
@@ -1378,7 +1393,19 @@ fn main() {
         .manage(catalog::Cache::default())
         .manage(RuntimeLock::default())
         .manage(Installations::default())
+        .on_page_load(|webview, payload| {
+            if cfg!(feature = "smoke-test")
+                && std::env::args().nth(1).as_deref() == Some("--ui-smoke-test")
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+            {
+                if let Err(error) = webview.eval(include_str!("ui_smoke.js")) {
+                    eprintln!("UI smoke injection failed: {error}");
+                    webview.app_handle().exit(1);
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            ui_smoke_result,
             snapshot,
             save_account,
             delete_account,
