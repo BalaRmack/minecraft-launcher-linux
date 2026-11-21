@@ -1193,6 +1193,27 @@ fn change_mod(app: tauri::AppHandle, id: String, name: String, action: String) -
     Ok(())
 }
 #[tauri::command]
+async fn open_external(url: String) -> Result<()> {
+    let parsed = reqwest::Url::parse(&url).map_err(err)?;
+    if url.len() > 4096
+        || parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("Разрешены только безопасные HTTPS-ссылки".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        Command::new("xdg-open")
+            .arg(parsed.as_str())
+            .spawn()
+            .map_err(err)?;
+        Ok(())
+    })
+    .await
+    .map_err(err)?
+}
+#[tauri::command]
 async fn catalog_search(
     app: tauri::AppHandle,
     params: catalog::Search,
@@ -1382,6 +1403,7 @@ fn main() {
             change_mod,
             search_mods,
             catalog_search,
+            open_external,
             catalog_categories,
             catalog_details,
             inspect_mods,

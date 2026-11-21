@@ -150,7 +150,7 @@ pub fn details(cache: &Cache, project: &str, version: &str, loader: &str) -> Res
             } else {
                 json!([])
             };
-        let compatible: Value = if !version.is_empty() && loader != "" && loader != "vanilla" {
+        let available: Value = if !version.is_empty() && loader != "" && loader != "vanilla" {
             let versions: Value = c
                 .get(format!(
                     "https://api.modrinth.com/v2/project/{project}/version"
@@ -168,15 +168,27 @@ pub fn details(cache: &Cache, project: &str, version: &str, loader: &str) -> Res
                 .map_err(err)?
                 .json()
                 .map_err(err)?;
-            versions
-                .as_array()
-                .and_then(|a| a.first())
-                .cloned()
-                .unwrap_or(Value::Null)
+            Value::Array(
+                versions
+                    .as_array()
+                    .ok_or("Некорректный список версий")?
+                    .iter()
+                    .take(25)
+                    .cloned()
+                    .collect(),
+            )
         } else {
-            Value::Null
+            json!([])
         };
-        Ok(json!({"project":project_data,"members":members,"compatible_version":compatible}))
+        let compatible = available
+            .as_array()
+            .and_then(|v| v.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        let available: Vec<Value> = available.as_array().unwrap().iter().map(|v| json!({"id":v["id"],"version_number":v["version_number"],"date_published":v["date_published"]})).collect();
+        Ok(
+            json!({"project":project_data,"members":members,"compatible_version":compatible,"available_versions":available}),
+        )
     })
 }
 fn files_lookup(cache: &Cache, hashes: &[String]) -> Result<Value> {

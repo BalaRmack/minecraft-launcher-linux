@@ -30,6 +30,11 @@ jobs:
           npm ci
           node --check ui/app.js
           npm test
+      - name: Exercise long descriptions in a real browser
+        run: |
+          npm install --no-save --ignore-scripts playwright-core@1.56.1
+          python3 -m http.server 4173 --bind 127.0.0.1 --directory ui > /tmp/horizon-ui-http.log 2>&1 &
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE="$(command -v google-chrome)" .github/scripts/annotated.sh node tests/browser-ui.cjs
       - name: Build Debian package
         run: .github/scripts/annotated.sh npx --yes @tauri-apps/cli@2 build --bundles deb -- --locked
       - uses: actions/upload-artifact@v4
