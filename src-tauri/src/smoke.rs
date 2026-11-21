@@ -1,5 +1,5 @@
 //! Opt-in live integration probe. Downloads real game files into a temporary directory.
-use crate::{java, modrinth, offline_uuid};
+use crate::{catalog, java, modrinth, offline_uuid};
 use mc_launcher_core::prelude::*;
 use std::{
     fs,
@@ -60,6 +60,34 @@ pub fn run() {
             })
             .unwrap();
             assert!(count > 0);
+            let cache = catalog::Cache::default();
+            let search = catalog::search(
+                &cache,
+                catalog::Search {
+                    query: "sodium".into(),
+                    version: "1.20.1".into(),
+                    loader: "fabric".into(),
+                    category: "".into(),
+                    sort: "relevance".into(),
+                    offset: 0,
+                },
+            )
+            .unwrap();
+            assert!(search["hits"].as_array().is_some_and(|a| !a.is_empty()));
+            let detail = catalog::details(&cache, "sodium", "1.20.1", "fabric").unwrap();
+            assert!(detail["compatible_version"].is_object());
+            let inspected =
+                catalog::inspect(&cache, &game.join("mods"), "1.20.1", "fabric").unwrap();
+            assert!(inspected
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["project"]["slug"] == "sodium"));
+            assert_eq!(
+                modrinth::install(&game.join("mods"), "sodium", "1.20.1", "fabric", |_| {})
+                    .unwrap(),
+                0
+            );
         }
         let version = launcher.load_version(&installed.version_id).unwrap();
         let command = launcher
